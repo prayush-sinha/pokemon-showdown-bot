@@ -89,6 +89,18 @@ class FutureSightBot(Player):
         # Keyed by battle.battle_tag -> {species: {"item": ..., "ev_level": ...}}
         self._opponent_profiles: dict[str, dict[str, dict]] = {}
 
+        # Phase 5.3: opponent HP snapshots, keyed the same way as
+        # _hp_snapshots but for the OPPONENT's side. Used to detect when an
+        # opponent Pokemon has taken direct observable damage, which is the
+        # signal that any Illusion disguise it was holding has broken.
+        self._opp_hp_snapshots: dict[str, dict[str, int]] = {}
+
+        # Phase 5.3: species whose true identity is confirmed for this
+        # battle (i.e. they've taken direct damage, so if they were a
+        # disguised Zoroark the Illusion has broken). Keyed by
+        # battle.battle_tag -> set of species strings.
+        self._confirmed_identity: dict[str, set[str]] = {}
+
     # ── Core decision hook ──────────────────────────────────────────────────
     def choose_move(self, battle):
         """
@@ -96,6 +108,7 @@ class FutureSightBot(Player):
 
         Turn Pipeline:
           1. Log turn snapshot.
+          1b. Track opponent identity confirmation (Phase 5.3 Illusion guard).
           2. Detect & analyse incoming damage (Phase 3 inverse calc).
           3. Scout new opponent Pokemon (Phase 2 Smogon priors).
           4. Snapshot our active Pokemon's HP for next turn.
@@ -104,6 +117,9 @@ class FutureSightBot(Player):
         """
         # 1. Log turn summary
         _log_turn_state(battle)
+
+        # 1b. Phase 5.3: track opponent identity confirmation (Illusion break detection)
+        self._track_opponent_identity(battle)
 
         # 2. Phase 3: detect and analyse incoming damage
         self._analyse_incoming_damage(battle)
@@ -196,6 +212,88 @@ class FutureSightBot(Player):
         if species:
             self._hp_snapshots[tag][species] = getattr(active, "current_hp", 0)
 
+    # ── Phase 5.3: Identity edge-case protections (Zoroark / Ditto / Transform) ──
+    def _track_opponent_identity(self, battle) -> None:
+        """
+        Snapshot the opponent active Pokemon's HP and, if it dropped since
+        last we saw it, mark that species as identity-confirmed for this
+        battle. Direct observable damage taken is the in-game signal that
+        an Illusion disguise (if any) has broken -- Illusion only holds
+        until the disguised Pokemon itself is hit.
+        """
+        opp = getattr(battle, "opponent_active_pokemon", None)
+        if opp is None:
+            return
+
+        tag = getattr(battle, "battle_tag", "")
+        species = getattr(opp, "species", None)
+        if not species:
+            return
+
+        current_hp = getattr(opp, "current_hp", 0)
+        prev_hp_map = self._opp_hp_snapshots.setdefault(tag, {})
+        prev_hp = prev_hp_map.get(species)
+
+        if prev_hp is not None and current_hp < prev_hp:
+            confirmed = self._confirmed_identity.setdefault(tag, set())
+            if species not in confirmed:
+                confirmed.add(species)
+                logger.debug(
+                    "[IDENTITY GUARD] %s took direct damage -- identity confirmed "
+                    "(any Illusion disguise has broken).", species,
+                )
+
+        prev_hp_map[species] = current_hp
+
+    @staticmethod
+    def _has_zoroark_threat(battle) -> bool:
+        """True if a Zoroark or Zoroark-Hisui is anywhere in the opponent's revealed team."""
+        opp_team = getattr(battle, "opponent_team", {}) or {}
+        for mon in opp_team.values():
+            species = (getattr(mon, "species", "") or "").lower().replace(" ", "").replace("-", "")
+            if species in ("zoroark", "zoroarkhisui"):
+                return True
+        return False
+
+    def _should_bypass_inverse_calc(self, battle, opp) -> tuple[bool, str]:
+        """
+        Phase 5.3: State & Identity Edge-Case Protections.
+
+        Returns (True, reason) if running the inverse damage calculator
+        against this opponent Pokemon right now would risk corrupting its
+        profile with the wrong underlying stats:
+
+          - Ditto / Transform / Imposter: the mon's stats are a COPY of
+            whatever it transformed into, not its own base stats, so any
+            inference here would silently overwrite the real profile with
+            garbage tied to a different (borrowed) statline.
+          - Zoroark Illusion: if a Zoroark or Zoroark-Hisui is anywhere on
+            the opponent's team and the currently displayed active species
+            hasn't yet taken direct damage this battle, it may actually BE
+            the disguised Zoroark wearing another team member's
+            appearance. Running inverse calc under the displayed (fake)
+            species would attribute the damage to the wrong Pokemon's
+            profile entirely.
+        """
+        species_norm = (getattr(opp, "species", "") or "").lower().replace(" ", "").replace("-", "")
+        ability_norm = (getattr(opp, "ability", "") or "").lower().replace(" ", "").replace("-", "")
+        known_move_ids = {
+            getattr(m, "id", "") for m in (getattr(opp, "moves", {}) or {}).values()
+        }
+
+        if species_norm == "ditto" or ability_norm == "imposter" or "transform" in known_move_ids:
+            return True, "Ditto/Transform/Imposter -- copied stats would corrupt the underlying profile"
+
+        tag = getattr(battle, "battle_tag", "")
+        if species_norm not in ("zoroark", "zoroarkhisui") and self._has_zoroark_threat(battle):
+            confirmed = self._confirmed_identity.get(tag, set())
+            if species_norm not in {
+                (s or "").lower().replace(" ", "").replace("-", "") for s in confirmed
+            }:
+                return True, "possible Zoroark Illusion -- identity unconfirmed until it takes direct damage"
+
+        return False, ""
+
     # ── Phase 3: Inverse damage analysis ────────────────────────────────────
     def _analyse_incoming_damage(self, battle) -> None:
         """
@@ -247,6 +345,17 @@ class FutureSightBot(Player):
         if defender_max_hp <= 0:
             return
 
+        # Phase 5.3: Zoroark Illusion / Ditto-Transform-Imposter guard.
+        # Bypass inverse calc entirely rather than risk writing a corrupted
+        # profile keyed to the wrong underlying Pokemon.
+        should_bypass, bypass_reason = self._should_bypass_inverse_calc(battle, opp)
+        if should_bypass:
+            logger.debug(
+                "[IDENTITY GUARD] Skipping inverse calc for %s: %s",
+                opp.species, bypass_reason,
+            )
+            return
+
         # Resolve types
         atk_types = [t.name if hasattr(t, "name") else str(t)
                      for t in (getattr(opp, "types", ()) or ()) if t is not None]
@@ -261,6 +370,15 @@ class FutureSightBot(Player):
         our_boosts = getattr(active, "boosts", {}) or {}
         def_stage = our_boosts.get("def", 0) if move_category == "Physical" else our_boosts.get("spd", 0)
 
+        # Phase 5.3: Multi-Hit Damage Range Intersection -- pull the
+        # previously-narrowed [low, high] Attack/Sp.Atk window (if any) for
+        # this attacker so infer_opponent_state can intersect it with what
+        # THIS hit implies, progressively narrowing the true stat window on
+        # repeated hits (accurately flagging Choice items over time).
+        tag_profiles = self._opponent_profiles.setdefault(tag, {})
+        profile = tag_profiles.setdefault(opp.species, {})
+        existing_range = profile.get("atk_range")
+
         try:
             result = infer_opponent_state(
                 observed_damage=damage_taken,
@@ -273,20 +391,21 @@ class FutureSightBot(Player):
                 field=field,
                 stat_stage_atk=atk_stage,
                 stat_stage_def=def_stage,
+                existing_range=existing_range,
             )
         except Exception as exc:
             logger.debug("[INVERSE CALC] Error: %s", exc)
             return
 
+        # Persist the (possibly narrowed) Attack/Sp.Atk range regardless of
+        # whether this hit alone produced a confident item/EV guess, so the
+        # window keeps tightening across the whole battle.
+        if result.estimated_attack_range is not None:
+            profile["atk_range"] = result.estimated_attack_range
+
         if result.matching_builds:
             logger.info("[INVERSE CALC] %s", result.summary())
 
-            if tag not in self._opponent_profiles:
-                self._opponent_profiles[tag] = {}
-            if opp.species not in self._opponent_profiles[tag]:
-                self._opponent_profiles[tag][opp.species] = {}
-
-            profile = self._opponent_profiles[tag][opp.species]
             if result.best_guess_item and not profile.get("item"):
                 profile["item"] = result.best_guess_item
                 profile["ev_level"] = result.best_guess_evs

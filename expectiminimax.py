@@ -421,6 +421,34 @@ def _calculate_action_damage(
     return dmg_range.min_damage, dmg_range.max_damage, "damage"
 
 
+def _simulate_ordered_outcomes(
+    our_prio: int,
+    opp_prio: int,
+    our_spe: int,
+    opp_spe: int,
+) -> list[tuple[bool, float]]:
+    """
+    Resolve turn order into one or more (bot_goes_first, probability) chance
+    branches.
+
+    Priority always breaks ties deterministically. Effective speed only
+    breaks ties deterministically when the two sides are NOT exactly equal.
+    A genuine speed tie (identical priority AND identical effective speed --
+    e.g. two max-Speed Jolly base-100s, or a full-team speed-tied mirror
+    match) is a real 50/50 coin flip on live Showdown, so we branch into two
+    chance nodes instead of arbitrarily awarding the tie to one side. This
+    also prevents the search from ever "hanging" on a degenerate tie state
+    by always making forward progress down both halves of the branch.
+    """
+    if our_prio > opp_prio:
+        return [(True, 1.0)]
+    if opp_prio > our_prio:
+        return [(False, 1.0)]
+    if our_spe == opp_spe:
+        return [(True, 0.5), (False, 0.5)]
+    return [(our_spe > opp_spe, 1.0)]
+
+
 def simulate_turn_outcomes(
     state: SimState,
     our_action: ActionCandidate,
@@ -465,13 +493,12 @@ def simulate_turn_outcomes(
     our_spe = _get_effective_speed(s.active_pokemon, s.side_conditions)
     opp_spe = _get_effective_speed(s.opponent_active_pokemon, s.opponent_side_conditions)
 
-    bot_goes_first = True
-    if our_prio > opp_prio:
-        bot_goes_first = True
-    elif opp_prio > our_prio:
-        bot_goes_first = False
-    else:
-        bot_goes_first = (our_spe >= opp_spe)
+    # Phase 5.1: Speed-Tie Chance Nodes. When priority AND effective speed
+    # are exactly equal, real Showdown coin-flips who moves first. Modeling
+    # this as a deterministic ">=" silently biases the whole search tree
+    # toward "we always win ties" and can hang/mislead on true 50/50s, so we
+    # branch into two chance nodes instead of picking one order outright.
+    order_branches = _simulate_ordered_outcomes(our_prio, opp_prio, our_spe, opp_spe)
 
     # ── 3. Execute Moves with Hit/Miss Chance Branches ───────────────────
     outcomes: list[tuple[SimState, float]] = []
@@ -514,108 +541,161 @@ def simulate_turn_outcomes(
     p_opp_hit = (opp_acc / 100.0) if isinstance(opp_acc, (int, float)) else 1.0
     p_opp_hit = max(0.0, min(1.0, p_opp_hit))
 
-    if bot_goes_first:
-        # Branch 1: Bot Hits
-        s1 = s.clone()
-        min_d1, max_d1, _ = _calculate_action_damage(
-            s1.active_pokemon, s1.opponent_active_pokemon,
-            our_move_id, our_move_data, is_attacker_bot=True
-        )
-        avg_d1 = (min_d1 + max_d1) // 2
-        s1.opponent_active_pokemon.current_hp = max(0, s1.opponent_active_pokemon.current_hp - avg_d1)
-        s1.opponent_active_pokemon.current_hp_fraction = s1.opponent_active_pokemon.current_hp / s1.opponent_active_pokemon.max_hp
-
-        # If opponent fainted, opponent DOES NOT counterattack
-        if s1.opponent_active_pokemon.current_hp == 0:
-            s1.opponent_active_pokemon.fainted = True
-            outcomes.append((s1, p_our_hit))
-        else:
-            # Opponent counterattacks
-            s1_hit2 = s1.clone()
-            min_d2, max_d2, _ = _calculate_action_damage(
-                s1_hit2.opponent_active_pokemon, s1_hit2.active_pokemon,
-                opp_action.move_id, opp_action.move_data, is_attacker_bot=False
-            )
-            avg_d2 = (min_d2 + max_d2) // 2
-            s1_hit2.active_pokemon.current_hp = max(0, s1_hit2.active_pokemon.current_hp - avg_d2)
-            s1_hit2.active_pokemon.current_hp_fraction = s1_hit2.active_pokemon.current_hp / s1_hit2.active_pokemon.max_hp
-            if s1_hit2.active_pokemon.current_hp == 0:
-                s1_hit2.active_pokemon.fainted = True
-
-            outcomes.append((s1_hit2, p_our_hit * p_opp_hit))
-            if p_opp_hit < 1.0:
-                outcomes.append((s1, p_our_hit * (1.0 - p_opp_hit)))
-
-        # Branch 2: Bot Misses
-        if p_our_hit < 1.0:
-            s2 = s.clone()
-            s2_hit2 = s2.clone()
-            min_d2, max_d2, _ = _calculate_action_damage(
-                s2_hit2.opponent_active_pokemon, s2_hit2.active_pokemon,
-                opp_action.move_id, opp_action.move_data, is_attacker_bot=False
-            )
-            avg_d2 = (min_d2 + max_d2) // 2
-            s2_hit2.active_pokemon.current_hp = max(0, s2_hit2.active_pokemon.current_hp - avg_d2)
-            s2_hit2.active_pokemon.current_hp_fraction = s2_hit2.active_pokemon.current_hp / s2_hit2.active_pokemon.max_hp
-            if s2_hit2.active_pokemon.current_hp == 0:
-                s2_hit2.active_pokemon.fainted = True
-
-            outcomes.append((s2_hit2, (1.0 - p_our_hit) * p_opp_hit))
-            if p_opp_hit < 1.0:
-                outcomes.append((s2, (1.0 - p_our_hit) * (1.0 - p_opp_hit)))
-
-    else:
-        # Opponent Goes First
-        # Branch 1: Opponent Hits
-        s1 = s.clone()
-        min_d2, max_d2, _ = _calculate_action_damage(
-            s1.opponent_active_pokemon, s1.active_pokemon,
-            opp_action.move_id, opp_action.move_data, is_attacker_bot=False
-        )
-        avg_d2 = (min_d2 + max_d2) // 2
-        s1.active_pokemon.current_hp = max(0, s1.active_pokemon.current_hp - avg_d2)
-        s1.active_pokemon.current_hp_fraction = s1.active_pokemon.current_hp / s1.active_pokemon.max_hp
-
-        # If Bot fainted, Bot does NOT counterattack
-        if s1.active_pokemon.current_hp == 0:
-            s1.active_pokemon.fainted = True
-            outcomes.append((s1, p_opp_hit))
-        else:
-            # Bot counterattacks
-            s1_hit1 = s1.clone()
+    # Fan out over each turn-order branch (normally one; two on a speed tie),
+    # scaling every resulting outcome's probability by that branch's weight.
+    for bot_goes_first, order_prob in order_branches:
+        if bot_goes_first:
+            # Branch 1: Bot Hits
+            s1 = s.clone()
             min_d1, max_d1, _ = _calculate_action_damage(
-                s1_hit1.active_pokemon, s1_hit1.opponent_active_pokemon,
+                s1.active_pokemon, s1.opponent_active_pokemon,
                 our_move_id, our_move_data, is_attacker_bot=True
             )
             avg_d1 = (min_d1 + max_d1) // 2
-            s1_hit1.opponent_active_pokemon.current_hp = max(0, s1_hit1.opponent_active_pokemon.current_hp - avg_d1)
-            s1_hit1.opponent_active_pokemon.current_hp_fraction = s1_hit1.opponent_active_pokemon.current_hp / s1_hit1.opponent_active_pokemon.max_hp
-            if s1_hit1.opponent_active_pokemon.current_hp == 0:
-                s1_hit1.opponent_active_pokemon.fainted = True
+            s1.opponent_active_pokemon.current_hp = max(0, s1.opponent_active_pokemon.current_hp - avg_d1)
+            s1.opponent_active_pokemon.current_hp_fraction = s1.opponent_active_pokemon.current_hp / s1.opponent_active_pokemon.max_hp
 
-            outcomes.append((s1_hit1, p_opp_hit * p_our_hit))
+            # If opponent fainted, opponent DOES NOT counterattack
+            if s1.opponent_active_pokemon.current_hp == 0:
+                s1.opponent_active_pokemon.fainted = True
+                outcomes.append((s1, order_prob * p_our_hit))
+            else:
+                # Opponent counterattacks
+                s1_hit2 = s1.clone()
+                min_d2, max_d2, _ = _calculate_action_damage(
+                    s1_hit2.opponent_active_pokemon, s1_hit2.active_pokemon,
+                    opp_action.move_id, opp_action.move_data, is_attacker_bot=False
+                )
+                avg_d2 = (min_d2 + max_d2) // 2
+                s1_hit2.active_pokemon.current_hp = max(0, s1_hit2.active_pokemon.current_hp - avg_d2)
+                s1_hit2.active_pokemon.current_hp_fraction = s1_hit2.active_pokemon.current_hp / s1_hit2.active_pokemon.max_hp
+                if s1_hit2.active_pokemon.current_hp == 0:
+                    s1_hit2.active_pokemon.fainted = True
+
+                outcomes.append((s1_hit2, order_prob * p_our_hit * p_opp_hit))
+                if p_opp_hit < 1.0:
+                    outcomes.append((s1, order_prob * p_our_hit * (1.0 - p_opp_hit)))
+
+            # Branch 2: Bot Misses
             if p_our_hit < 1.0:
-                outcomes.append((s1, p_opp_hit * (1.0 - p_our_hit)))
+                s2 = s.clone()
+                s2_hit2 = s2.clone()
+                min_d2, max_d2, _ = _calculate_action_damage(
+                    s2_hit2.opponent_active_pokemon, s2_hit2.active_pokemon,
+                    opp_action.move_id, opp_action.move_data, is_attacker_bot=False
+                )
+                avg_d2 = (min_d2 + max_d2) // 2
+                s2_hit2.active_pokemon.current_hp = max(0, s2_hit2.active_pokemon.current_hp - avg_d2)
+                s2_hit2.active_pokemon.current_hp_fraction = s2_hit2.active_pokemon.current_hp / s2_hit2.active_pokemon.max_hp
+                if s2_hit2.active_pokemon.current_hp == 0:
+                    s2_hit2.active_pokemon.fainted = True
 
-        # Branch 2: Opponent Misses
-        if p_opp_hit < 1.0:
-            s2 = s.clone()
-            s2_hit1 = s2.clone()
-            min_d1, max_d1, _ = _calculate_action_damage(
-                s2_hit1.active_pokemon, s2_hit1.opponent_active_pokemon,
-                our_move_id, our_move_data, is_attacker_bot=True
+                outcomes.append((s2_hit2, order_prob * (1.0 - p_our_hit) * p_opp_hit))
+                if p_opp_hit < 1.0:
+                    outcomes.append((s2, order_prob * (1.0 - p_our_hit) * (1.0 - p_opp_hit)))
+
+        else:
+            # Opponent Goes First
+            # Branch 1: Opponent Hits
+            s1 = s.clone()
+            min_d2, max_d2, _ = _calculate_action_damage(
+                s1.opponent_active_pokemon, s1.active_pokemon,
+                opp_action.move_id, opp_action.move_data, is_attacker_bot=False
             )
-            avg_d1 = (min_d1 + max_d1) // 2
-            s2_hit1.opponent_active_pokemon.current_hp = max(0, s2_hit1.opponent_active_pokemon.current_hp - avg_d1)
-            s2_hit1.opponent_active_pokemon.current_hp_fraction = s2_hit1.opponent_active_pokemon.current_hp / s2_hit1.opponent_active_pokemon.max_hp
-            if s2_hit1.opponent_active_pokemon.current_hp == 0:
-                s2_hit1.opponent_active_pokemon.fainted = True
+            avg_d2 = (min_d2 + max_d2) // 2
+            s1.active_pokemon.current_hp = max(0, s1.active_pokemon.current_hp - avg_d2)
+            s1.active_pokemon.current_hp_fraction = s1.active_pokemon.current_hp / s1.active_pokemon.max_hp
 
-            outcomes.append((s2_hit1, (1.0 - p_opp_hit) * p_our_hit))
-            if p_our_hit < 1.0:
-                outcomes.append((s2, (1.0 - p_opp_hit) * (1.0 - p_our_hit)))
+            # If Bot fainted, Bot does NOT counterattack
+            if s1.active_pokemon.current_hp == 0:
+                s1.active_pokemon.fainted = True
+                outcomes.append((s1, order_prob * p_opp_hit))
+            else:
+                # Bot counterattacks
+                s1_hit1 = s1.clone()
+                min_d1, max_d1, _ = _calculate_action_damage(
+                    s1_hit1.active_pokemon, s1_hit1.opponent_active_pokemon,
+                    our_move_id, our_move_data, is_attacker_bot=True
+                )
+                avg_d1 = (min_d1 + max_d1) // 2
+                s1_hit1.opponent_active_pokemon.current_hp = max(0, s1_hit1.opponent_active_pokemon.current_hp - avg_d1)
+                s1_hit1.opponent_active_pokemon.current_hp_fraction = s1_hit1.opponent_active_pokemon.current_hp / s1_hit1.opponent_active_pokemon.max_hp
+                if s1_hit1.opponent_active_pokemon.current_hp == 0:
+                    s1_hit1.opponent_active_pokemon.fainted = True
+
+                outcomes.append((s1_hit1, order_prob * p_opp_hit * p_our_hit))
+                if p_our_hit < 1.0:
+                    outcomes.append((s1, order_prob * p_opp_hit * (1.0 - p_our_hit)))
+
+            # Branch 2: Opponent Misses
+            if p_opp_hit < 1.0:
+                s2 = s.clone()
+                s2_hit1 = s2.clone()
+                min_d1, max_d1, _ = _calculate_action_damage(
+                    s2_hit1.active_pokemon, s2_hit1.opponent_active_pokemon,
+                    our_move_id, our_move_data, is_attacker_bot=True
+                )
+                avg_d1 = (min_d1 + max_d1) // 2
+                s2_hit1.opponent_active_pokemon.current_hp = max(0, s2_hit1.opponent_active_pokemon.current_hp - avg_d1)
+                s2_hit1.opponent_active_pokemon.current_hp_fraction = s2_hit1.opponent_active_pokemon.current_hp / s2_hit1.opponent_active_pokemon.max_hp
+                if s2_hit1.opponent_active_pokemon.current_hp == 0:
+                    s2_hit1.opponent_active_pokemon.fainted = True
+
+                outcomes.append((s2_hit1, order_prob * (1.0 - p_opp_hit) * p_our_hit))
+                if p_our_hit < 1.0:
+                    outcomes.append((s2, order_prob * (1.0 - p_opp_hit) * (1.0 - p_our_hit)))
 
     return outcomes
+
+
+# =============================================================================
+# State-Only Action Gathering (for recursive lookahead beyond depth 1)
+# =============================================================================
+def _fallback_tackle_action() -> list[OpponentActionCandidate]:
+    """Degenerate fallback opponent action when nothing else is known."""
+    tackle_data = _MOVES_DB.get("tackle", {})
+    return [OpponentActionCandidate(action_type="move", label="tackle", move_id="tackle", move_data=tackle_data, probability=1.0)]
+
+
+def _gather_state_bot_actions(state: SimState) -> list[ActionCandidate]:
+    """
+    Derive our own legal-ish actions purely from a simulated SimState.
+
+    The real `get_best_action` root ply gets its action list straight from
+    poke-env's `battle.available_moves` / `battle.available_switches`
+    (which correctly account for PP, choice-lock, trapping, etc). Once the
+    search recurses past the root into a simulated future state, those
+    poke-env objects no longer exist -- so this reconstructs a reasonable
+    action list (known moves + alive teammates) directly from the
+    SimState instead. This is what lets Iterative Deepening actually reach
+    Depth 3-4 rather than stopping after one ply.
+    """
+    candidates: list[ActionCandidate] = []
+    active = state.active_pokemon
+    if active is None or active.fainted:
+        return candidates
+
+    for move_id in active.moves.keys():
+        norm_id = move_id.lower().replace(" ", "").replace("-", "")
+        if norm_id in _MOVES_DB:
+            candidates.append(ActionCandidate(
+                action_type="move",
+                label=f"move: {norm_id}",
+                poke_env_object=None,
+                move_id=norm_id,
+            ))
+
+    for mon in state.team.values():
+        if mon is active or mon.fainted:
+            continue
+        candidates.append(ActionCandidate(
+            action_type="switch",
+            label=f"switch: {mon.species}",
+            poke_env_object=None,
+            switch_species=mon.species,
+        ))
+
+    return candidates
 
 
 # =============================================================================
@@ -660,7 +740,11 @@ class ExpectiminimaxEngine:
             best_action_object: Move or Pokemon instance to pass to create_order()
             ranked_candidates: list of (label, expected_value) sorted descending
         """
-        start_time = time.time()
+        # Phase 5.1: monotonic timer -- perf_counter() is immune to wall-clock
+        # adjustments (NTP jumps, DST, etc.) and gives microsecond
+        # resolution, which time.time() does not guarantee.
+        start_time = time.perf_counter()
+        deadline_s = self.max_time_ms / 1000.0
 
         # Convert battle to root SimState
         root_state = battle_to_sim_state(battle, opponent_profiles)
@@ -697,32 +781,96 @@ class ExpectiminimaxEngine:
         # ── 2. Gather Opponent Projected Actions ─────────────────────────
         opp_actions = self._gather_opponent_actions(battle)
 
-        # ── 3. Evaluate Expected Values via Tree Search ───────────────────
-        action_scores: list[tuple[ActionCandidate, float]] = []
+        # ── 3. Iterative Deepening Search (Phase 5.1) ─────────────────────
+        # Depth 1 always runs to completion regardless of the timer, so we
+        # always have a legal action to return even under extreme time
+        # pressure (e.g. a slow first turn on a loaded server).
+        best_candidate, ranked_list = self._evaluate_all_actions(
+            root_state, bot_actions, opp_actions, depth=1,
+            start_time=start_time, deadline_s=deadline_s,
+        )
+        completed_depth = 1
 
-        for action in bot_actions:
-            ev = self._evaluate_action_ev(
-                state=root_state,
-                our_action=action,
-                opp_actions=opp_actions,
-                depth_remaining=self.depth,
-                start_time=start_time,
+        for current_depth in range(2, self.depth + 1):
+            if (time.perf_counter() - start_time) >= deadline_s:
+                logger.debug(
+                    "Iterative deepening: time exhausted before starting depth %d; "
+                    "keeping depth %d results.", current_depth, completed_depth,
+                )
+                break
+
+            ply_candidate, ply_ranked, aborted = self._evaluate_all_actions_guarded(
+                root_state, bot_actions, opp_actions, depth=current_depth,
+                start_time=start_time, deadline_s=deadline_s,
             )
-            action_scores.append((action, ev))
 
-        # Sort descending by Expected Value
-        action_scores.sort(key=lambda item: item[1], reverse=True)
+            if aborted:
+                # Safety Fallback: a depth search aborted mid-evaluation due
+                # to the timer budget -- discard the partial ply entirely
+                # and keep the best action from the last FULLY completed
+                # depth instead of trusting a half-evaluated ranking.
+                logger.debug(
+                    "Iterative deepening: depth %d aborted mid-evaluation (timeout); "
+                    "discarding partial ply, keeping depth %d results.",
+                    current_depth, completed_depth,
+                )
+                break
 
-        best_candidate = action_scores[0][0]
-        ranked_list = [(cand.label, score) for cand, score in action_scores]
+            best_candidate, ranked_list = ply_candidate, ply_ranked
+            completed_depth = current_depth
 
-        elapsed_ms = (time.time() - start_time) * 1000.0
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         logger.debug(
-            "Expectiminimax search (depth=%d) evaluated %d actions in %.1fms. Best: %s (EV=%.1f)",
-            self.depth, len(bot_actions), elapsed_ms, best_candidate.label, action_scores[0][1]
+            "Expectiminimax search (target depth=%d, completed depth=%d) evaluated "
+            "%d actions in %.1fms. Best: %s (EV=%.1f)",
+            self.depth, completed_depth, len(bot_actions), elapsed_ms,
+            best_candidate.label, ranked_list[0][1],
         )
 
         return best_candidate.poke_env_object, ranked_list
+
+    def _evaluate_all_actions(
+        self,
+        state: SimState,
+        bot_actions: list[ActionCandidate],
+        opp_actions: list[OpponentActionCandidate],
+        depth: int,
+        start_time: float,
+        deadline_s: float,
+    ) -> tuple[ActionCandidate, list[tuple[str, float]]]:
+        """Evaluate every root action at a given depth, unconditionally (no abort)."""
+        action_scores = [
+            (action, self._evaluate_action_ev(state, action, opp_actions, depth, start_time, deadline_s))
+            for action in bot_actions
+        ]
+        action_scores.sort(key=lambda item: item[1], reverse=True)
+        ranked_list = [(cand.label, score) for cand, score in action_scores]
+        return action_scores[0][0], ranked_list
+
+    def _evaluate_all_actions_guarded(
+        self,
+        state: SimState,
+        bot_actions: list[ActionCandidate],
+        opp_actions: list[OpponentActionCandidate],
+        depth: int,
+        start_time: float,
+        deadline_s: float,
+    ) -> tuple[Optional[ActionCandidate], list[tuple[str, float]], bool]:
+        """
+        Evaluate every root action at a given depth, aborting (and
+        signalling `aborted=True`) the moment the timer budget is blown
+        mid-ply, so the caller can discard the partial results.
+        """
+        action_scores: list[tuple[ActionCandidate, float]] = []
+        for action in bot_actions:
+            if (time.perf_counter() - start_time) >= deadline_s:
+                return None, [], True
+            ev = self._evaluate_action_ev(state, action, opp_actions, depth, start_time, deadline_s)
+            action_scores.append((action, ev))
+
+        action_scores.sort(key=lambda item: item[1], reverse=True)
+        ranked_list = [(cand.label, score) for cand, score in action_scores]
+        return action_scores[0][0], ranked_list, False
 
     def _evaluate_action_ev(
         self,
@@ -731,9 +879,12 @@ class ExpectiminimaxEngine:
         opp_actions: list[OpponentActionCandidate],
         depth_remaining: int,
         start_time: float,
+        deadline_s: float,
     ) -> float:
         """
-        Compute EV of a specific bot action across opponent distribution.
+        Compute EV of a specific bot action across the opponent's projected
+        move distribution, recursing `depth_remaining - 1` further plies
+        deep (Phase 5.1) instead of always flattening to a 1-ply heuristic.
         """
         total_ev = 0.0
 
@@ -743,12 +894,16 @@ class ExpectiminimaxEngine:
 
             opp_ev = 0.0
             for next_state, chance_prob in outcomes:
-                # Check terminal or depth limit
-                if depth_remaining <= 1 or (time.time() - start_time) * 1000.0 > self.max_time_ms:
+                if chance_prob <= 0.0:
+                    continue
+                if depth_remaining <= 1 or (time.perf_counter() - start_time) >= deadline_s:
                     leaf_score = evaluate_state(next_state)
                 else:
-                    # Recursive 1-ply deeper evaluation (simplification: 1-ply heuristic at next ply)
-                    leaf_score = evaluate_state(next_state)
+                    # Recurse: assume we play our own best response from
+                    # here, then fold the opponent's distribution back in.
+                    leaf_score = self._search_best_response(
+                        next_state, depth_remaining - 1, start_time, deadline_s
+                    )
 
                 opp_ev += leaf_score * chance_prob
 
@@ -756,18 +911,86 @@ class ExpectiminimaxEngine:
 
         return total_ev
 
+    def _search_best_response(
+        self,
+        state: SimState,
+        depth_remaining: int,
+        start_time: float,
+        deadline_s: float,
+    ) -> float:
+        """
+        Recursive interior ply (Phase 5.1): at a simulated future state,
+        assume our side plays whichever of ITS available actions maximizes
+        EV, then folds the opponent's projected distribution back in for
+        that ply. This is what actually lets Iterative Deepening reach
+        Depth 3-4, versus the prior implementation which always flattened
+        every branch to a single heuristic evaluation after 1 ply.
+        """
+        # Terminal checks
+        won = getattr(state, "won", None)
+        if won is True:
+            return SCORE_WIN
+        if won is False:
+            return SCORE_LOSS
+
+        active = state.active_pokemon
+        opp_active = state.opponent_active_pokemon
+        if active is None or opp_active is None or active.fainted or opp_active.fainted:
+            # A faint mid-line means a forced switch is coming that we
+            # can't project cleanly -- fall back to the heuristic here
+            # rather than guessing at the replacement.
+            return evaluate_state(state)
+
+        if (time.perf_counter() - start_time) >= deadline_s:
+            return evaluate_state(state)
+
+        our_candidates = _gather_state_bot_actions(state)
+        if not our_candidates:
+            return evaluate_state(state)
+
+        opp_candidates = self._gather_state_opponent_actions(state)
+
+        best_ev = float("-inf")
+        for our_cand in our_candidates:
+            if (time.perf_counter() - start_time) >= deadline_s:
+                break
+            ev = self._evaluate_action_ev(
+                state, our_cand, opp_candidates, depth_remaining, start_time, deadline_s
+            )
+            if ev > best_ev:
+                best_ev = ev
+
+        return best_ev if best_ev != float("-inf") else evaluate_state(state)
+
     def _gather_opponent_actions(self, battle) -> list[OpponentActionCandidate]:
-        """Gather likely opponent moves with prior probabilities."""
+        """Gather likely opponent moves with prior probabilities (root ply)."""
         opp = getattr(battle, "opponent_active_pokemon", None)
+        if opp is None:
+            return _fallback_tackle_action()
+        revealed_moves = getattr(opp, "moves", {}) or {}
+        return self._gather_opponent_actions_for(opp.species, revealed_moves.keys())
+
+    def _gather_state_opponent_actions(self, state: SimState) -> list[OpponentActionCandidate]:
+        """
+        Gather likely opponent moves with prior probabilities from a
+        simulated SimState (used by recursive lookahead beyond depth 1,
+        where we no longer have the original poke-env Battle object).
+        """
+        opp = state.opponent_active_pokemon
+        if opp is None or opp.fainted:
+            return _fallback_tackle_action()
+        return self._gather_opponent_actions_for(opp.species, opp.moves.keys())
+
+    def _gather_opponent_actions_for(self, species: str, revealed_move_ids) -> list[OpponentActionCandidate]:
+        """
+        Shared core: build the opponent's projected move distribution from
+        (a) any already-revealed moves, filled out with (b) Smogon prior
+        probabilities up to 4 total moves.
+        """
         opp_actions: list[OpponentActionCandidate] = []
 
-        if opp is None:
-            tackle_data = _MOVES_DB.get("tackle", {})
-            return [OpponentActionCandidate(action_type="move", label="tackle", move_id="tackle", move_data=tackle_data, probability=1.0)]
-
         # 1. Revealed moves
-        revealed_moves = getattr(opp, "moves", {}) or {}
-        for mid, mobj in revealed_moves.items():
+        for mid in revealed_move_ids:
             norm_id = mid.lower().replace(" ", "").replace("-", "")
             mdata = _MOVES_DB.get(norm_id)
             if mdata:
@@ -781,7 +1004,7 @@ class ExpectiminimaxEngine:
 
         # 2. Smogon Priors if we have fewer than 4 moves
         if len(opp_actions) < 4 and self.priors is not None:
-            build = self.priors.get_likely_build(opp.species)
+            build = self.priors.get_likely_build(species)
             if build:
                 known_ids = {a.move_id for a in opp_actions}
                 for mp in build.top_moves:
@@ -800,8 +1023,7 @@ class ExpectiminimaxEngine:
 
         # Fallback if no moves known
         if not opp_actions:
-            tackle_data = _MOVES_DB.get("tackle", {})
-            return [OpponentActionCandidate(action_type="move", label="tackle", move_id="tackle", move_data=tackle_data, probability=1.0)]
+            return _fallback_tackle_action()
 
         # Normalize probabilities to sum to 1.0
         total_p = sum(a.probability for a in opp_actions)

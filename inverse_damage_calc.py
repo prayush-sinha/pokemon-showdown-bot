@@ -133,6 +133,7 @@ class InferredState:
     best_guess_item: Optional[str] = None
     best_guess_evs: Optional[str] = None
     estimated_attack_stat: Optional[int] = None
+    estimated_attack_range: Optional[tuple[int, int]] = None
 
     def summary(self) -> str:
         """One-line summary for console logging."""
@@ -143,6 +144,9 @@ class InferredState:
 
         matches = " / ".join(b.label for b, _ in self.matching_builds[:3])
         atk_str = f"Est. Atk: {self.estimated_attack_stat}" if self.estimated_attack_stat else ""
+        if self.estimated_attack_range:
+            lo, hi = self.estimated_attack_range
+            atk_str += f" [range {lo}-{hi}]" if atk_str else f"Atk range: {lo}-{hi}"
         return (f"Took {self.observed_damage} dmg ({self.observed_percent:.1%}) "
                 f"from {self.attacker_species}'s {self.move_name}. "
                 f"Inferred: {matches}"
@@ -535,6 +539,7 @@ def infer_opponent_state(
     stat_stage_atk: int = 0,
     stat_stage_def: int = 0,
     smogon_priors=None,
+    existing_range: Optional[tuple[int, int]] = None,
 ) -> InferredState:
     """
     Given observed damage, deduce the opponent's likely build.
@@ -561,11 +566,19 @@ def infer_opponent_state(
         Attacker's attack/sp.atk stage.
     stat_stage_def : int
         Defender's defense/sp.def stage.
+    existing_range : tuple[int, int] or None
+        The previous [low, high] estimated Attack/Sp.Atk stat window for
+        this attacker, carried over from an earlier hit this battle. When
+        given, the window derived from THIS hit is intersected with it,
+        so repeated hits progressively narrow the true stat window
+        (Phase 5.3: Multi-Hit Damage Range Intersection). Pass None on
+        the attacker's first observed hit.
 
     Returns
     -------
     InferredState
-        Contains matching builds and best-guess item/EVs.
+        Contains matching builds, best-guess item/EVs, and the
+        (possibly narrowed) estimated_attack_range.
     """
     field = field or FieldConditions()
     observed_pct = observed_damage / defender_max_hp if defender_max_hp > 0 else 0
@@ -580,6 +593,7 @@ def infer_opponent_state(
             move_name=move_name,
             observed_damage=observed_damage,
             observed_percent=observed_pct,
+            estimated_attack_range=existing_range,
         )
 
     base_power = move_data.get("basePower", 0)
@@ -593,6 +607,7 @@ def infer_opponent_state(
             move_name=move_name,
             observed_damage=observed_damage,
             observed_percent=observed_pct,
+            estimated_attack_range=existing_range,
         )
 
     # Type effectiveness
@@ -603,6 +618,7 @@ def infer_opponent_state(
             move_name=move_name,
             observed_damage=observed_damage,
             observed_percent=observed_pct,
+            estimated_attack_range=existing_range,
         )
 
     # STAB check
@@ -667,6 +683,7 @@ def infer_opponent_state(
     best_item = None
     best_evs = None
     est_atk = None
+    est_range = existing_range  # carry over unchanged if this hit is uninformative
 
     if matching:
         # Prefer the most constrained match (narrowest range)
@@ -675,6 +692,37 @@ def infer_opponent_state(
         best_item = best_build.item or "(no item boost)"
         best_evs = f"{best_build.ev_investment} EVs ({best_build.nature})"
         est_atk = resolve_build_attack_stat(atk_key, best_build, move_category)
+
+        # ── Phase 5.3: Multi-Hit Damage Range Intersection ───────────────
+        # Collect the Attack/Sp.Atk stat implied by EVERY candidate build
+        # consistent with this hit (not just the narrowest match), giving
+        # the [low, high] window this single observation allows.
+        atk_stats_this_hit = [
+            resolve_build_attack_stat(atk_key, build, move_category)
+            for build, _ in matching
+        ]
+        curr_low, curr_high = min(atk_stats_this_hit), max(atk_stats_this_hit)
+
+        if existing_range is not None:
+            prev_low, prev_high = existing_range
+            new_low = max(prev_low, curr_low)
+            new_high = min(prev_high, curr_high)
+            if new_low > new_high:
+                # The two observations are mutually inconsistent (e.g. a
+                # stat-boosting move, an item switch via Trick, or a
+                # different Pokemon entirely was mistaken for the same
+                # one). Don't collapse to an empty/invalid range -- trust
+                # the freshest observation and restart the window.
+                logger.debug(
+                    "Range intersection for %s produced an empty window "
+                    "(prev=%s, curr=%s); resetting to latest observation.",
+                    attacker_species, existing_range, (curr_low, curr_high),
+                )
+                new_low, new_high = curr_low, curr_high
+        else:
+            new_low, new_high = curr_low, curr_high
+
+        est_range = (new_low, new_high)
 
     return InferredState(
         attacker_species=attacker_species,
@@ -685,6 +733,7 @@ def infer_opponent_state(
         best_guess_item=best_item,
         best_guess_evs=best_evs,
         estimated_attack_stat=est_atk,
+        estimated_attack_range=est_range,
     )
 
 

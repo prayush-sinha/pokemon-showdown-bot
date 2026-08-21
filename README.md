@@ -4,7 +4,7 @@ An advanced, game-theoretic Pokémon Showdown AI battle bot built with Python an
 
 ---
 
-## Architecture & Key Features
+## 🌟 Architecture & Key Features
 
 FutureSight AI uses a 4-phase decision pipeline to tackle simultaneous turns, imperfect information, and RNG in Pokémon battles:
 
@@ -38,7 +38,7 @@ FutureSight AI uses a 4-phase decision pipeline to tackle simultaneous turns, im
 
 ---
 
-## Repository Structure
+## 📁 Repository Structure
 
 - `bot.py`: Main bot client, game loop, and CLI runner.
 - `expectiminimax.py`: Phase 4B simultaneous expectiminimax tree search engine.
@@ -50,7 +50,7 @@ FutureSight AI uses a 4-phase decision pipeline to tackle simultaneous turns, im
 
 ---
 
-## Quick Start
+## 🚀 Quick Start
 
 ### 1. Installation
 
@@ -92,7 +92,7 @@ python bot.py --showdown --username "YourUsername" --password "YourPassword" --a
 
 ---
 
-## Configuration
+## 🛠️ Configuration
 
 You can customize the bot by setting environment variables or editing `config.py`:
 
@@ -107,6 +107,6 @@ You can customize the bot by setting environment variables or editing `config.py
 
 ---
 
-##  License
+## 📜 License
 
 MIT License.

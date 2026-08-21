@@ -103,6 +103,28 @@ SCREEN_VALUES: dict[str, float] = {
 # Tailwind bonus
 WEIGHT_TAILWIND = 50.0
 
+# ─── Phase 5.2: Endgame Anti-Choke Logic ────────────────────────────────────
+# When the opponent is down to their last 1-2 Pokemon, passive/greedy plays
+# (laying hazards, setting up stat boosts) provide little-to-no future
+# utility -- there aren't enough remaining switch-ins or turns left for them
+# to pay off. Left unchecked, the search engine will happily "throw" a
+# winning position by choosing Stealth Rock or Swords Dance over a lethal
+# attack. These multipliers re-shape the heuristic in that situation so
+# direct KO lines dominate the search.
+ENDGAME_OPP_ALIVE_THRESHOLD = 2      # opponent alive count <= this triggers endgame mode
+ENDGAME_HAZARD_MULTIPLIER = 0.0      # hazards provide zero value once triggered
+ENDGAME_STAT_STAGE_MULTIPLIER = 0.5  # halve the value of stat boosts / setup
+ENDGAME_ALIVE_BONUS_MULTIPLIER = 2.5  # amplify the material (KO) differential reward
+
+
+def _is_endgame(opp_alive: int) -> bool:
+    """
+    True when the opponent has few enough living Pokemon that passive,
+    long-horizon plays (hazards, setup) stop paying off and the engine
+    should be biased hard toward direct KO lines instead.
+    """
+    return 0 < opp_alive <= ENDGAME_OPP_ALIVE_THRESHOLD
+
 
 # =============================================================================
 # Data classes
@@ -266,23 +288,29 @@ def evaluate_state(battle) -> float:
     hp_diff = our_hp_total - opp_hp_total
     score += hp_diff * WEIGHT_HP_RATIO
 
-    # Alive count advantage
-    alive_diff = our_alive - opp_alive
-    score += alive_diff * WEIGHT_ALIVE_BONUS
+    # ── Phase 5.2: Endgame Anti-Choke -- dynamic weight shifts ───────────
+    endgame = _is_endgame(opp_alive)
+    alive_bonus_mult = ENDGAME_ALIVE_BONUS_MULTIPLIER if endgame else 1.0
+    stat_stage_mult = ENDGAME_STAT_STAGE_MULTIPLIER if endgame else 1.0
+    hazard_mult = ENDGAME_HAZARD_MULTIPLIER if endgame else 1.0
 
-    # ── Active Pokemon stat stages ──────────────────────────────────────
-    score += _score_stat_stages(getattr(battle, "active_pokemon", None), multiplier=1.0)
-    score += _score_stat_stages(getattr(battle, "opponent_active_pokemon", None), multiplier=-1.0)
+    # Alive count advantage (amplified in the endgame to force KO lines)
+    alive_diff = our_alive - opp_alive
+    score += alive_diff * WEIGHT_ALIVE_BONUS * alive_bonus_mult
+
+    # ── Active Pokemon stat stages (halved in the endgame -- no more setup) ─
+    score += _score_stat_stages(getattr(battle, "active_pokemon", None), multiplier=1.0 * stat_stage_mult)
+    score += _score_stat_stages(getattr(battle, "opponent_active_pokemon", None), multiplier=-1.0 * stat_stage_mult)
 
     # ── Status conditions ───────────────────────────────────────────────
     score += _score_team_statuses(our_team, multiplier=1.0)
     score += _score_team_statuses(opp_team, multiplier=-1.0)
 
-    # ── Entry hazards ───────────────────────────────────────────────────
+    # ── Entry hazards (zeroed in the endgame -- no future switch-ins to punish) ─
     # Hazards on the OPPONENT's side benefit us (positive)
-    score += _score_hazards(getattr(battle, "opponent_side_conditions", {}) or {}, multiplier=1.0)
+    score += _score_hazards(getattr(battle, "opponent_side_conditions", {}) or {}, multiplier=1.0 * hazard_mult)
     # Hazards on OUR side hurt us (negative)
-    score += _score_hazards(getattr(battle, "side_conditions", {}) or {}, multiplier=-1.0)
+    score += _score_hazards(getattr(battle, "side_conditions", {}) or {}, multiplier=-1.0 * hazard_mult)
 
     # ── Screens ─────────────────────────────────────────────────────────
     score += _score_screens(getattr(battle, "side_conditions", {}) or {}, multiplier=1.0)
@@ -1018,7 +1046,7 @@ class _MockStatus:
         self.name = name
 
 
-from poke_env.battle.move import Move
+from poke_env.battle.move import Move, MoveSet
 from poke_env.battle.pokemon import Pokemon
 
 
@@ -1054,7 +1082,13 @@ class _MockPokemon(Pokemon):
             self._status = _MockStatus(status)
         self._fainted = fainted
         if moves:
-            self._moves = moves
+            # Pokemon.moves (poke-env >=0.9) reads self._moves.moves, i.e.
+            # self._moves must be a MoveSet wrapper, NOT a raw dict -- mirror
+            # exactly how the real Pokemon class populates it internally
+            # (see Pokemon._add_move: `self._moves[move.id] = move`).
+            self._moves = MoveSet({})
+            for move_id, move_obj in moves.items():
+                self._moves[move_id] = move_obj
 
 
 class _MockSideCondition:
@@ -1205,9 +1239,24 @@ def _run_tests():
     sr_on_opp = _MockSideCondition("STEALTH_ROCK")
     spikes_on_opp = _MockSideCondition("SPIKES")
 
+    # NOTE: opponent needs > ENDGAME_OPP_ALIVE_THRESHOLD mons alive here, or
+    # the Phase 5.2 endgame anti-choke logic correctly zeroes hazard value
+    # (see TestEndgameHeuristic in test_suite.py for that behavior).
+    opp_filler_1 = _MockPokemon("magnezone", hp_fraction=1.0, max_hp=250,
+                                 stats={"atk": 150, "def": 200, "spa": 300, "spd": 200, "spe": 180},
+                                 types=["Electric", "Steel"])
+    opp_filler_2 = _MockPokemon("clefable", hp_fraction=1.0, max_hp=280,
+                                 stats={"atk": 150, "def": 220, "spa": 220, "spd": 260, "spe": 170},
+                                 types=["Fairy"])
+    our_filler_1 = _MockPokemon("corviknight", hp_fraction=1.0, max_hp=341,
+                                 stats={"atk": 262, "def": 309, "spa": 137, "spd": 206, "spe": 170},
+                                 types=["Flying", "Steel"])
+    our_filler_2 = _MockPokemon("toxapex", hp_fraction=1.0, max_hp=304,
+                                 stats={"atk": 152, "def": 353, "spa": 137, "spd": 293, "spe": 96},
+                                 types=["Poison", "Water"])
     hazard_battle = _MockBattle(
-        our_team={"p1: Garchomp": garchomp},
-        opp_team={"p2: Dragapult": dragapult},
+        our_team={"p1: Garchomp": garchomp, "p1: Corviknight": our_filler_1, "p1: Toxapex": our_filler_2},
+        opp_team={"p2: Dragapult": dragapult, "p2: Magnezone": opp_filler_1, "p2: Clefable": opp_filler_2},
         active_pokemon=garchomp,
         opponent_active_pokemon=dragapult,
         opponent_side_conditions={sr_on_opp: 1, spikes_on_opp: 2},
