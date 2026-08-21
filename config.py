@@ -13,8 +13,8 @@ import os
 SERVER_MODE = os.getenv("SERVER_MODE", "showdown")
 
 # ─── Account Credentials (only needed for SERVER_MODE="showdown") ──────────────
-BOT_USERNAME = os.getenv("BOT_USERNAME", "Curiousboysenberry")
-BOT_PASSWORD = os.getenv("BOT_PASSWORD", "john@1170845L")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "yourbotname")
+BOT_PASSWORD = os.getenv("BOT_PASSWORD", "yourbotpassword")
 
 # ─── Battle Settings ───────────────────────────────────────────────────────────
 # The format the bot will play. "gen9randombattle" requires no team.
