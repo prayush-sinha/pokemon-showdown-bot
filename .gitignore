@@ -9,9 +9,16 @@ venv/
 ENV/
 .venv
 
-# Cache and logs
+# Cache, data, logs, and patches
 .cache/
+data/
 *.log
+*.patch
+
+# Internal documentation and blueprints (keep local)
+FutureSightBot_Technical_Whitepaper.md
+UPGRADE_ROADMAP.md
+Future_Sight_AI_Clone_Blueprint.pdf
 
 # Submodules & Local Server
 pokemon-showdown/
