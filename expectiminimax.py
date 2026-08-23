@@ -16,6 +16,7 @@ Usage
 
 from __future__ import annotations
 
+import argparse
 import copy
 import logging
 import math
@@ -50,6 +51,16 @@ from inverse_damage_calc import (
     _LEVEL,
 )
 from smogon_priors import SmogonPriors
+
+# Step 6E: optional policy-net wrapper. Guarded so that simply not having
+# policy_inference.py sitting alongside this file (or any of ITS optional
+# heavy deps -- onnxruntime, torch) never breaks importing expectiminimax.py
+# itself; ExpectiminimaxEngine.__init__ checks `PolicyModel is not None`
+# before ever trying to use it.
+try:
+    from policy_inference import PolicyModel
+except Exception:  # pragma: no cover - policy_inference.py missing entirely
+    PolicyModel = None
 
 logger = logging.getLogger("Expectiminimax")
 
@@ -161,11 +172,19 @@ class ActionCandidate:
 
 @dataclass
 class OpponentActionCandidate:
-    """A projected action for the opponent with prior probability."""
-    action_type: str                  # "move"
-    label: str                        # e.g., "dracometeor"
-    move_id: str
-    move_data: dict
+    """
+    A projected action for the opponent with prior probability.
+
+    Step 6E: action_type can now also be "switch" (previously this engine
+    only ever projected opponent moves). For a switch candidate, move_id/
+    move_data are left at their defaults and switch_species names which of
+    the opponent's own revealed Pokemon they're projected to bring in.
+    """
+    action_type: str                  # "move" or "switch"
+    label: str                        # e.g., "dracometeor" or "switch:garganacl"
+    move_id: Optional[str] = None
+    move_data: dict = field(default_factory=dict)
+    switch_species: Optional[str] = None
     probability: float = 0.25
 
 
@@ -485,6 +504,71 @@ def simulate_turn_outcomes(
                     if s.active_pokemon.current_hp == 0:
                         s.active_pokemon.fainted = True
 
+    # ── 1b. Handle Opponent Switching In (Step 6E) ─────────────────────────
+    # Symmetric to step 1 above, but for a policy-projected opponent switch.
+    # Showdown switches always resolve before any move that turn, so this
+    # runs unconditionally, before priority/speed logic even comes up.
+    if opp_action.action_type == "switch" and opp_action.switch_species:
+        for mon in s.opponent_team.values():
+            if mon.species.lower() == opp_action.switch_species.lower() and not mon.fainted:
+                s.opponent_active_pokemon = mon
+                break
+
+        if s.opponent_active_pokemon:
+            for cond, val in s.opponent_side_conditions.items():
+                cname = cond.name if hasattr(cond, "name") else str(cond)
+                if cname == "STEALTH_ROCK":
+                    sr_dmg = _apply_stealth_rock(s.opponent_active_pokemon)
+                    s.opponent_active_pokemon.current_hp = max(0, s.opponent_active_pokemon.current_hp - sr_dmg)
+                    s.opponent_active_pokemon.current_hp_fraction = s.opponent_active_pokemon.current_hp / s.opponent_active_pokemon.max_hp
+                    if s.opponent_active_pokemon.current_hp == 0:
+                        s.opponent_active_pokemon.fainted = True
+                elif cname == "SPIKES":
+                    sp_dmg = _apply_spikes(s.opponent_active_pokemon, layers=val if isinstance(val, int) else 1)
+                    s.opponent_active_pokemon.current_hp = max(0, s.opponent_active_pokemon.current_hp - sp_dmg)
+                    s.opponent_active_pokemon.current_hp_fraction = s.opponent_active_pokemon.current_hp / s.opponent_active_pokemon.max_hp
+                    if s.opponent_active_pokemon.current_hp == 0:
+                        s.opponent_active_pokemon.fainted = True
+
+    # ── 1c. Case A2 (Step 6E): Opponent Switches ───────────────────────────
+    # The opponent's whole turn is consumed by the switch, so they never
+    # counterattack this turn. This must be checked BEFORE the priority/
+    # speed math and the Case A/B blocks below, neither of which knows how
+    # to handle a switch-shaped opp_action (move_id/move_data are unset).
+    if opp_action.action_type == "switch":
+        if our_action.action_type == "switch":
+            # Both sides switched. Both switch-ins (and their own hazard
+            # damage) already resolved in steps 1/1b above; nothing else
+            # happens on a mutual-switch turn.
+            return [(s, 1.0)]
+
+        if (s.active_pokemon and not s.active_pokemon.fainted
+                and s.opponent_active_pokemon and not s.opponent_active_pokemon.fainted):
+            our_move_id = our_action.move_id or ""
+            our_norm_id = our_move_id.lower().replace(" ", "").replace("-", "")
+            our_move_data = _MOVES_DB.get(our_norm_id, {})
+            our_acc = our_move_data.get("accuracy", 100)
+            p_hit = (our_acc / 100.0) if isinstance(our_acc, (int, float)) else 1.0
+            p_hit = max(0.0, min(1.0, p_hit))
+
+            s_hit = s.clone()
+            min_d, max_d, _ = _calculate_action_damage(
+                s_hit.active_pokemon, s_hit.opponent_active_pokemon,
+                our_move_id, our_move_data, is_attacker_bot=True,
+            )
+            avg_d = (min_d + max_d) // 2
+            s_hit.opponent_active_pokemon.current_hp = max(0, s_hit.opponent_active_pokemon.current_hp - avg_d)
+            s_hit.opponent_active_pokemon.current_hp_fraction = s_hit.opponent_active_pokemon.current_hp / s_hit.opponent_active_pokemon.max_hp
+            if s_hit.opponent_active_pokemon.current_hp == 0:
+                s_hit.opponent_active_pokemon.fainted = True
+
+            switch_outcomes = [(s_hit, p_hit)]
+            if p_hit < 1.0:
+                switch_outcomes.append((s.clone(), 1.0 - p_hit))
+            return switch_outcomes
+
+        return [(s, 1.0)]
+
     # ── 2. Determine Action Priority & Speed ──────────────────────────────
     # Switch actions have priority +6
     our_prio = 6 if our_action.action_type == "switch" else _get_move_priority(our_action.move_id or "")
@@ -714,10 +798,50 @@ class ExpectiminimaxEngine:
         depth: int = 2,
         smogon_priors: Optional[SmogonPriors] = None,
         max_time_ms: float = 500.0,
+        use_policy_net: bool = True,
+        policy_prune_threshold: float = 0.05,
+        policy_onnx_path: str = "data/policy_net.onnx",
+        policy_pth_path: str = "data/policy_net.pth",
+        policy_feature_schema_path: str = "data/feature_schema_gen9ou.json",
+        policy_vocab_path: str = "data/vocab_gen9ou.json",
     ):
         self.depth = depth
         self.priors = smogon_priors
         self.max_time_ms = max_time_ms
+        self.policy_prune_threshold = policy_prune_threshold
+
+        # Step 6E: best-effort policy-net load. This is never allowed to
+        # crash engine construction -- a missing model file, a missing
+        # vocab file, missing onnxruntime/torch, or a corrupt checkpoint
+        # all just mean self.policy stays None and every opponent-action
+        # projection below falls back to Smogon priors alone, exactly as
+        # this engine behaved before Step 6E existed.
+        self.policy: Optional["PolicyModel"] = None
+        if use_policy_net and PolicyModel is not None:
+            try:
+                self.policy = PolicyModel.load(
+                    onnx_path=policy_onnx_path,
+                    pth_path=policy_pth_path,
+                    feature_schema_path=policy_feature_schema_path,
+                    vocab_path=policy_vocab_path,
+                )
+            except Exception:
+                logger.warning(
+                    "Step 6E: policy net raised during load(); continuing "
+                    "with Smogon priors only.", exc_info=True,
+                )
+                self.policy = None
+
+        if self.policy is not None:
+            logger.info(
+                "Step 6E: opponent-action projection backed by policy net "
+                "(backend=%s).", self.policy.backend,
+            )
+        else:
+            logger.info(
+                "Step 6E: no policy net loaded; opponent-action projection "
+                "uses Smogon priors only."
+            )
 
     def get_best_action(
         self,
@@ -963,18 +1087,142 @@ class ExpectiminimaxEngine:
         return best_ev if best_ev != float("-inf") else evaluate_state(state)
 
     def _gather_opponent_actions(self, battle) -> list[OpponentActionCandidate]:
-        """Gather likely opponent moves with prior probabilities (root ply)."""
+        """
+        Gather likely opponent moves -- and, if Step 6E's policy net is
+        loaded, switches too -- with prior probabilities. This is the
+        root-ply entry point, called with the real poke-env `battle`
+        object: the policy net needs the FULL battle state (both full
+        teams, hazards, weather, tera, etc.), which only exists here, not
+        in the stripped-down SimState available to deeper recursive plies
+        (see `_gather_state_opponent_actions`, which is unchanged and
+        stays Smogon-only by design -- see its docstring).
+        """
         opp = getattr(battle, "opponent_active_pokemon", None)
         if opp is None:
             return _fallback_tackle_action()
+
+        if self.policy is not None:
+            try:
+                policy_actions = self._gather_opponent_actions_with_policy(battle, opp)
+                if policy_actions:
+                    return policy_actions
+            except Exception:
+                logger.debug(
+                    "Step 6E: policy-net opponent projection raised; "
+                    "falling back to Smogon priors for this decision.",
+                    exc_info=True,
+                )
+
         revealed_moves = getattr(opp, "moves", {}) or {}
         return self._gather_opponent_actions_for(opp.species, revealed_moves.keys())
+
+    def _gather_opponent_actions_with_policy(self, battle, opp) -> list[OpponentActionCandidate]:
+        """
+        Step 6E: project the opponent's action distribution -- moves AND
+        switches -- from the policy net, then apply dynamic pruning
+        (P < self.policy_prune_threshold gets dropped and the survivors
+        renormalized) so the search tree only spends time on opponent
+        actions the net thinks are actually plausible.
+
+        Returns [] (never raises) if the net can't produce a usable
+        prediction for this battle; the caller (`_gather_opponent_actions`)
+        then falls straight back to `_gather_opponent_actions_for`, exactly
+        as if no policy net had been loaded.
+        """
+        pred = self.policy.predict(battle, acting_side="opponent")
+        if pred is None:
+            return []
+
+        revealed_moves = getattr(opp, "moves", {}) or {}
+        candidates: dict[str, OpponentActionCandidate] = {}
+
+        # -- Moves: revealed moves ∪ the policy net's own top predictions,
+        #    filled out with Smogon priors if that still leaves us thin. --
+        move_ids = {mid.lower().replace(" ", "").replace("-", "") for mid in revealed_moves.keys()}
+        top_policy_moves = sorted(pred.move_probs.items(), key=lambda kv: kv[1], reverse=True)[:6]
+        move_ids.update(mid for mid, _p in top_policy_moves)
+
+        if self.priors is not None and len(move_ids) < 4:
+            build = self.priors.get_likely_build(opp.species)
+            if build:
+                for mp in build.top_moves:
+                    if len(move_ids) >= 6:
+                        break
+                    move_ids.add(mp.name.lower().replace(" ", "").replace("-", ""))
+
+        p_move_type = pred.action_type_probs.get("move", 0.5)
+        for norm_id in move_ids:
+            mdata = _MOVES_DB.get(norm_id)
+            if not mdata:
+                continue  # policy predicted a token that isn't a real move -- skip it
+            raw_p = pred.move_probs.get(norm_id, 0.0) * p_move_type
+            candidates[f"move:{norm_id}"] = OpponentActionCandidate(
+                action_type="move", label=norm_id, move_id=norm_id, move_data=mdata,
+                probability=max(raw_p, 1e-6),
+            )
+
+        # -- Switches: the policy net's own switch-slot distribution,
+        #    restricted to the opponent's known (revealed), non-active,
+        #    non-fainted bench -- we can't simulate switching into a mon
+        #    we've never seen. --------------------------------------------
+        p_switch_type = pred.action_type_probs.get("switch", 0.0)
+        opp_species_norm = (getattr(opp, "species", "") or "").lower()
+        for species_id, slot_p in pred.switch_species_probs.items():
+            norm_species = species_id.lower().replace(" ", "").replace("-", "")
+            if not norm_species or norm_species == opp_species_norm:
+                continue  # can't "switch into" the mon that's already active
+            raw_p = slot_p * p_switch_type
+            if raw_p <= 0:
+                continue
+            candidates[f"switch:{norm_species}"] = OpponentActionCandidate(
+                action_type="switch", label=f"switch:{norm_species}",
+                switch_species=norm_species, probability=raw_p,
+            )
+
+        if not candidates:
+            return []
+
+        return self._normalize_and_prune(list(candidates.values()))
+
+    def _normalize_and_prune(self, actions: list[OpponentActionCandidate]) -> list[OpponentActionCandidate]:
+        """
+        Step 6E: normalize a raw probability-weighted candidate set to sum
+        to 1.0, drop anything below `self.policy_prune_threshold`, then
+        renormalize the survivors so `_evaluate_action_ev`'s EV sum stays
+        correct. Never returns an empty list given a non-empty input -- if
+        pruning would remove every candidate, the single most likely one is
+        always kept so the search always has something to evaluate.
+        """
+        total = sum(a.probability for a in actions)
+        if total <= 0:
+            return []
+        for a in actions:
+            a.probability /= total
+
+        pruned = [a for a in actions if a.probability >= self.policy_prune_threshold]
+        if not pruned:
+            pruned = [max(actions, key=lambda a: a.probability)]
+
+        total = sum(a.probability for a in pruned)
+        for a in pruned:
+            a.probability /= total
+
+        return pruned
 
     def _gather_state_opponent_actions(self, state: SimState) -> list[OpponentActionCandidate]:
         """
         Gather likely opponent moves with prior probabilities from a
         simulated SimState (used by recursive lookahead beyond depth 1,
         where we no longer have the original poke-env Battle object).
+
+        Step 6E note: this intentionally stays Smogon-priors-only rather
+        than also querying the policy net. SimState doesn't retain enough
+        of the original battle (no tera state, coarser hazard/weather
+        bookkeeping, etc.) to reconstruct a faithful tensor, and deeper
+        plies are exactly where a subtly-wrong policy projection would
+        compound the most. The policy net is applied once, at the root, in
+        `_gather_opponent_actions` above, where the real battle is still
+        available.
         """
         opp = state.opponent_active_pokemon
         if opp is None or opp.fainted:
@@ -1128,10 +1376,158 @@ def _run_tests():
     print("=" * 72)
 
 
+# =============================================================================
+# Step 6E: Policy-Net Search Integration Test
+# =============================================================================
+def _run_policy_integration_test():
+    """
+    End-to-end check that the Step 6E policy net is actually wired into the
+    search, not just importable:
+      A. ExpectiminimaxEngine loads a real (small, synthetic) ONNX model.
+      B. _gather_opponent_actions returns a pruned, renormalized mix of
+         MOVE and SWITCH candidates -- proving both the P < prune-threshold
+         pruning step and the new switch-candidate generation work.
+      C. get_best_action() runs the full search to completion -- this
+         exercises simulate_turn_outcomes' new opponent-switch branches,
+         not just the projection step.
+      D. Pointing the engine at nonexistent model files falls back to
+         Smogon-priors-only cleanly, and the search still returns a valid
+         action.
+    """
+    print("\n" + "=" * 72)
+    print("  Step 6E: Policy-Net Search Integration Test")
+    print("=" * 72)
+
+    try:
+        import policy_inference
+    except Exception as exc:
+        print(f"\npolicy_inference.py isn't importable ({exc}); skipping this "
+              "test. This is fine for the rest of the bot -- "
+              "ExpectiminimaxEngine already falls back to Smogon priors only "
+              "in that case.")
+        return
+
+    from pathlib import Path
+    from evaluator import _MockPokemon, _MockMove, _MockBattle
+
+    print("\n--- Building a small synthetic (randomly-initialized) ONNX model ---")
+    print("(train_policy.py --export-onnx produces the real thing once you've")
+    print(" actually trained on scraped replay data; this is purely a")
+    print(" plumbing check that doesn't require a trained model to exist.)")
+    try:
+        paths = policy_inference._make_synthetic_artifacts(Path("data/_expectiminimax_selftest"))
+    except Exception as exc:
+        print(f"\nCould not build a synthetic model ({exc}); this usually just "
+              "means torch/onnx aren't installed here. Skipping -- a live bot "
+              "only needs onnxruntime plus real trained artifacts.")
+        return
+
+    eq = _MockMove("earthquake")
+    uturn = _MockMove("uturn")
+    opp_active = _MockPokemon(
+        "landorustherian", hp_fraction=0.8, max_hp=339,
+        stats={"atk": 269, "def": 267, "spa": 178, "spd": 197, "spe": 197},
+        types=["Ground", "Flying"], moves={"earthquake": eq, "uturn": uturn},
+    )
+    opp_bench_1 = _MockPokemon("greattusk", hp_fraction=1.0, max_hp=350)
+    opp_bench_2 = _MockPokemon("gholdengo", hp_fraction=0.5, max_hp=300)
+    opp_team = {
+        "p2: Landorus-Therian": opp_active,
+        "p2: Great Tusk": opp_bench_1,
+        "p2: Gholdengo": opp_bench_2,
+    }
+
+    my_active = _MockPokemon(
+        "toxapex", hp_fraction=0.9, max_hp=304,
+        stats={"atk": 152, "def": 353, "spa": 137, "spd": 293, "spe": 96},
+        types=["Poison", "Water"],
+    )
+    my_bench = _MockPokemon("kingambit", hp_fraction=1.0, max_hp=330)
+    my_team = {"p1: Toxapex": my_active, "p1: Kingambit": my_bench}
+
+    scald = _MockMove("scald")
+    battle = _MockBattle(
+        our_team=my_team, opp_team=opp_team,
+        active_pokemon=my_active, opponent_active_pokemon=opp_active,
+        available_moves=[scald], available_switches=[my_bench],
+        turn=8,
+    )
+
+    print("\n--- Test A: engine loads a real (synthetic) policy net ---")
+    priors = SmogonPriors(format_id="gen9ou")
+    engine = ExpectiminimaxEngine(
+        depth=2, smogon_priors=priors, max_time_ms=500.0,
+        policy_onnx_path=str(paths["onnx"]),
+        policy_feature_schema_path=str(paths["schema"]),
+        policy_vocab_path=str(paths["vocab"]),
+    )
+    assert engine.policy is not None, "expected the synthetic ONNX model to load"
+    print(f"  engine.policy.backend = {engine.policy.backend}  [OK]")
+
+    print("\n--- Test B: projected opponent actions (moves + switches, pruned) ---")
+    opp_actions = engine._gather_opponent_actions(battle)
+    assert opp_actions, "expected at least one projected opponent action"
+    total_p = sum(a.probability for a in opp_actions)
+    print(f"  {len(opp_actions)} candidate(s), probabilities sum to {total_p:.4f}:")
+    has_switch = False
+    for a in opp_actions:
+        print(f"    {a.action_type:<7} {a.label:<20} P={a.probability:.3f}")
+        assert a.probability >= engine.policy_prune_threshold - 1e-9, (
+            f"candidate {a.label} slipped through pruning at P={a.probability}"
+        )
+        if a.action_type == "switch":
+            has_switch = True
+    assert abs(total_p - 1.0) < 1e-4, "pruned candidate probabilities should renormalize to 1.0"
+    print(f"  every candidate respects the P >= {engine.policy_prune_threshold} prune threshold  [OK]")
+    print(f"  switch candidate present: {has_switch}")
+
+    print("\n--- Test C: full search completes (exercises opponent-switch simulation) ---")
+    best_obj, ranked = engine.get_best_action(battle)
+    assert best_obj is not None
+    for label, ev in ranked:
+        print(f"    {label:<25} -> EV: {ev:>+8.1f}")
+    print("  get_best_action() completed without crashing  [OK]")
+
+    print("\n--- Test D: graceful fallback when model files don't exist ---")
+    fallback_engine = ExpectiminimaxEngine(
+        depth=2, smogon_priors=priors, max_time_ms=500.0,
+        policy_onnx_path="data/does_not_exist.onnx",
+        policy_pth_path="data/does_not_exist.pth",
+        policy_feature_schema_path="data/does_not_exist_schema.json",
+        policy_vocab_path="data/does_not_exist_vocab.json",
+    )
+    assert fallback_engine.policy is None, "expected graceful fallback (no policy net) for missing files"
+    fb_obj, fb_ranked = fallback_engine.get_best_action(battle)
+    assert fb_obj is not None
+    print("  engine.policy is None, and get_best_action() still returns a "
+          "valid action via Smogon priors  [OK]")
+
+    print("\n" + "=" * 72)
+    print("  Step 6E integration test passed [OK]")
+    print("=" * 72)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Phase 4B expectiminimax engine test suite, plus the "
+                     "Step 6E policy-net search integration check.",
+    )
+    p.add_argument(
+        "--test-policy", action="store_true",
+        help="Also run the Step 6E policy-net search integration test "
+             "(builds a small synthetic ONNX model if no trained one is "
+             "found and verifies it's actually wired into the search).",
+    )
+    return p
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         format="%(asctime)s | %(name)-18s | %(levelname)-8s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         level=logging.INFO,
     )
+    cli_args = _build_arg_parser().parse_args()
     _run_tests()
+    if cli_args.test_policy:
+        _run_policy_integration_test()

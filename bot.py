@@ -71,10 +71,19 @@ class FutureSightBot(Player):
         )
 
         # Phase 4: Expectiminimax Search Engine
+        # Step 6E: policy-net kwargs are passed through unconditionally --
+        # ExpectiminimaxEngine.__init__ handles a missing/absent model
+        # gracefully and falls back to Smogon priors only.
         self.search_engine = ExpectiminimaxEngine(
             depth=2,
             smogon_priors=self._priors,
             max_time_ms=500.0,
+            use_policy_net=config.POLICY_NET_ENABLED,
+            policy_prune_threshold=config.POLICY_PRUNE_THRESHOLD,
+            policy_onnx_path=config.POLICY_ONNX_PATH,
+            policy_pth_path=config.POLICY_PTH_PATH,
+            policy_feature_schema_path=config.POLICY_FEATURE_SCHEMA_PATH,
+            policy_vocab_path=config.POLICY_VOCAB_PATH,
         )
 
         # Per-battle tracking: which opponent species we've already scouted.

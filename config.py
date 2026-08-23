@@ -37,3 +37,22 @@ PRIORS_FORMAT = os.getenv("PRIORS_FORMAT", "gen9ou")
 # How long (in seconds) before re-fetching stats from the server.
 # Default: 24 hours. Set to 0 to always fetch fresh data.
 PRIORS_CACHE_MAX_AGE = int(os.getenv("PRIORS_CACHE_MAX_AGE", str(24 * 60 * 60)))
+
+# ─── Policy Net (Phase 6, Step 6E) ──────────────────────────────────────────────
+# If True, the search engine tries to load a trained policy net (ONNX
+# preferred, PyTorch checkpoint as fallback) and uses it to weight/prune the
+# opponent's projected moves and switches. If the files below don't exist,
+# or the required runtime (onnxruntime / torch) isn't installed, the engine
+# transparently falls back to Smogon priors only -- this flag does not need
+# to be turned off just because you haven't trained a model yet.
+POLICY_NET_ENABLED = os.getenv("POLICY_NET_ENABLED", "true").lower() not in ("0", "false", "no")
+
+POLICY_ONNX_PATH = os.getenv("POLICY_ONNX_PATH", "data/policy_net.onnx")
+POLICY_PTH_PATH = os.getenv("POLICY_PTH_PATH", "data/policy_net.pth")
+POLICY_FEATURE_SCHEMA_PATH = os.getenv("POLICY_FEATURE_SCHEMA_PATH", "data/feature_schema_gen9ou.json")
+POLICY_VOCAB_PATH = os.getenv("POLICY_VOCAB_PATH", "data/vocab_gen9ou.json")
+
+# Opponent actions predicted with probability below this are pruned from the
+# search tree (and the remaining candidates renormalized) so search time
+# isn't spent on moves/switches the policy net considers unrealistic.
+POLICY_PRUNE_THRESHOLD = float(os.getenv("POLICY_PRUNE_THRESHOLD", "0.05"))
