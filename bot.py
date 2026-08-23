@@ -64,26 +64,28 @@ class FutureSightBot(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Phase 2: Smogon priors engine (shared across all battles)
+        # Determine active format and resolve format-specific data paths
+        self._active_format = kwargs.get("battle_format", config.BATTLE_FORMAT)
+        paths = config.get_format_paths(self._active_format)
+
+        # Phase 2: Smogon priors engine (tailored to active format)
+        priors_fmt = config.PRIORS_FORMAT if "random" in self._active_format.lower() else self._active_format
         self._priors = SmogonPriors(
-            format_id=config.PRIORS_FORMAT,
+            format_id=priors_fmt,
             cache_max_age=config.PRIORS_CACHE_MAX_AGE,
         )
 
-        # Phase 4: Expectiminimax Search Engine
-        # Step 6E: policy-net kwargs are passed through unconditionally --
-        # ExpectiminimaxEngine.__init__ handles a missing/absent model
-        # gracefully and falls back to Smogon priors only.
+        # Phase 4: Expectiminimax Search Engine (using format-specific neural net paths)
         self.search_engine = ExpectiminimaxEngine(
             depth=2,
             smogon_priors=self._priors,
             max_time_ms=500.0,
             use_policy_net=config.POLICY_NET_ENABLED,
             policy_prune_threshold=config.POLICY_PRUNE_THRESHOLD,
-            policy_onnx_path=config.POLICY_ONNX_PATH,
-            policy_pth_path=config.POLICY_PTH_PATH,
-            policy_feature_schema_path=config.POLICY_FEATURE_SCHEMA_PATH,
-            policy_vocab_path=config.POLICY_VOCAB_PATH,
+            policy_onnx_path=paths["onnx"],
+            policy_pth_path=paths["pth"],
+            policy_feature_schema_path=paths["schema"],
+            policy_vocab_path=paths["vocab"],
         )
 
         # Per-battle tracking: which opponent species we've already scouted.
@@ -156,7 +158,11 @@ class FutureSightBot(Player):
                 )
 
             if best_action is not None:
-                return self.create_order(best_action)
+                # Check for battle gimmicks (Mega Evolution, Terastallization)
+                is_move = not hasattr(best_action, "species")
+                can_mega = is_move and bool(getattr(battle, "can_mega_evolve", False))
+                can_tera = is_move and bool(getattr(battle, "can_tera", False))
+                return self.create_order(best_action, mega=can_mega, terastallize=can_tera)
         except Exception as exc:
             logger.warning("[BRAIN] Search failed with error (%s), falling back to random move", exc, exc_info=True)
 
@@ -502,13 +508,15 @@ def make_bot(
     username: Optional[str] = None,
     password: Optional[str] = None,
     use_showdown: bool = False,
+    battle_format: Optional[str] = None,
 ) -> FutureSightBot:
     """Construct a FutureSightBot wired to the correct server."""
     username = username or config.BOT_USERNAME
     password = password or config.BOT_PASSWORD
+    chosen_format = battle_format or config.BATTLE_FORMAT
 
     kwargs = dict(
-        battle_format=config.BATTLE_FORMAT,
+        battle_format=chosen_format,
         max_concurrent_battles=config.MAX_CONCURRENT_BATTLES,
         log_level=config.LOG_LEVEL,
     )
@@ -516,10 +524,10 @@ def make_bot(
     if use_showdown or config.SERVER_MODE == "showdown":
         kwargs["account_configuration"] = AccountConfiguration(username, password)
         kwargs["server_configuration"] = ShowdownServerConfiguration
-        logger.info("Connecting to play.pokemonshowdown.com as '%s'", username)
+        logger.info("Connecting to play.pokemonshowdown.com as '%s' (Format: %s)", username, chosen_format)
     else:
         kwargs["account_configuration"] = AccountConfiguration(username, None)
-        logger.info("Connecting to local server as '%s'", username)
+        logger.info("Connecting to local server as '%s' (Format: %s)", username, chosen_format)
 
     return FutureSightBot(**kwargs)
 
@@ -711,6 +719,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Override the bot password from config.py.",
     )
+    parser.add_argument(
+        "--format",
+        type=str,
+        default=None,
+        help="Battle format to play (e.g. gen9randombattle, gen9ou, gen9championsbssregma).",
+    )
 
     return parser.parse_args(argv)
 
@@ -733,6 +747,7 @@ async def main(argv: list[str] | None = None) -> None:
         username=args.username,
         password=args.password,
         use_showdown=args.showdown,
+        battle_format=args.format,
     )
 
     try:

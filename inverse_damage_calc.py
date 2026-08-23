@@ -279,6 +279,11 @@ def calculate_damage_range(
     level: int = _LEVEL,
     stat_stage_atk: int = 0,
     stat_stage_def: int = 0,
+    weather: Optional[str] = None,
+    terrain: Optional[str] = None,
+    move_type: Optional[str] = None,
+    move_id: Optional[str] = None,
+    defender_types: Optional[list[str]] = None,
 ) -> DamageRange:
     """
     Compute the 16-step damage range for a single hit.
@@ -311,6 +316,16 @@ def calculate_damage_range(
         Attack stat stage modifier (-6 to +6).
     stat_stage_def : int
         Defense stat stage modifier (-6 to +6).
+    weather : str or None
+        Active weather name.
+    terrain : str or None
+        Active terrain name.
+    move_type : str or None
+        Move element type (e.g., "Fire", "Water").
+    move_id : str or None
+        Normalized move identifier.
+    defender_types : list[str] or None
+        Defender Pokémon's element types.
 
     Returns
     -------
@@ -319,9 +334,23 @@ def calculate_damage_range(
     """
     field = field or FieldConditions()
 
+    # Active weather & terrain resolution
+    active_weather = (weather or field.weather or "").lower().replace("-", "").replace(" ", "").replace("_", "")
+    active_terrain = (terrain or field.terrain or "").lower().replace("-", "").replace(" ", "").replace("_", "")
+    norm_mtype = (move_type or "").capitalize()
+    def_types_norm = [t.lower() for t in (defender_types or [])]
+
     # Apply stat stages
     a = _apply_stat_stage(attacker_stat, stat_stage_atk)
     d = _apply_stat_stage(defender_stat, stat_stage_def)
+
+    # Weather defensive boosts (Snow boosts Ice def by 1.5x; Sand boosts Rock spd by 1.5x)
+    if "snow" in active_weather or "hail" in active_weather:
+        if "ice" in def_types_norm and move_category == "Physical":
+            d = math.floor(d * 1.5)
+    elif "sand" in active_weather:
+        if "rock" in def_types_norm and move_category == "Special":
+            d = math.floor(d * 1.5)
 
     # Apply ability modifier to attacking stat
     a = math.floor(a * ability_modifier)
@@ -329,7 +358,7 @@ def calculate_damage_range(
     # Base damage calculation
     # floor( floor( (2*Level/5 + 2) * BasePower * A/D ) / 50 + 2 )
     level_factor = math.floor(2 * level / 5) + 2
-    inner = math.floor(level_factor * base_power * a / d)
+    inner = math.floor(level_factor * base_power * a / max(1, d))
     base_damage = math.floor(inner / 50) + 2
 
     # Build modifier chain (applied sequentially with floors)
@@ -342,14 +371,30 @@ def calculate_damage_range(
         elif move_category == "Special" and field.light_screen:
             modifiers.append(0.5)
 
-    # Weather
-    if field.weather == "sun":
-        modifiers.append(1.5 if move_category == "Physical" else 1.0)  # Not direct
-        # Actually: sun boosts Fire moves, weakens Water moves
-        # We'll handle this via a separate weather_modifier below
-    # (Weather is complex; simplified here -- applied as type-specific)
-    # For a production calc, we'd need move type + weather interaction.
-    # We keep it simple for the inverse solver's purposes.
+    # Weather offensive modifiers
+    if "sun" in active_weather or "sunny" in active_weather or "desolateland" in active_weather:
+        if norm_mtype == "Fire":
+            modifiers.append(1.5)
+        elif norm_mtype == "Water":
+            modifiers.append(0.5)
+    elif "rain" in active_weather or "primordialsea" in active_weather:
+        if norm_mtype == "Water":
+            modifiers.append(1.5)
+        elif norm_mtype == "Fire":
+            modifiers.append(0.5)
+
+    # Terrain modifiers (Gen 9: 1.3x boost for matching terrain)
+    if "electric" in active_terrain and norm_mtype == "Electric":
+        modifiers.append(1.3)
+    elif "grassy" in active_terrain:
+        if norm_mtype == "Grass":
+            modifiers.append(1.3)
+        elif move_id in ("earthquake", "magnitude", "bulldoze"):
+            modifiers.append(0.5)
+    elif "psychic" in active_terrain and norm_mtype == "Psychic":
+        modifiers.append(1.3)
+    elif "misty" in active_terrain and norm_mtype == "Dragon":
+        modifiers.append(0.5)
 
     # STAB
     if stab:

@@ -45,6 +45,7 @@ from inverse_damage_calc import (
     calc_all_stats,
     _apply_stat_stage,
     ITEM_MODIFIERS,
+    FieldConditions,
     _POKEDEX,
     _MOVES_DB,
     _TYPE_CHART,
@@ -86,6 +87,7 @@ class SimPokemon:
     item: Optional[str] = None
     ability: Optional[str] = None
     moves: dict[str, Any] = field(default_factory=dict)
+    level: int = 100
 
     def clone(self) -> SimPokemon:
         return SimPokemon(
@@ -101,6 +103,7 @@ class SimPokemon:
             item=self.item,
             ability=self.ability,
             moves=dict(self.moves),
+            level=self.level,
         )
 
 
@@ -117,6 +120,7 @@ class SimState:
     side_conditions: dict[Any, Any] = field(default_factory=dict)
     opponent_side_conditions: dict[Any, Any] = field(default_factory=dict)
     weather: dict[Any, Any] = field(default_factory=dict)
+    fields: dict[Any, Any] = field(default_factory=dict)
     turn: int = 1
     won: Optional[bool] = None
 
@@ -152,6 +156,7 @@ class SimState:
             side_conditions=dict(self.side_conditions),
             opponent_side_conditions=dict(self.opponent_side_conditions),
             weather=dict(self.weather),
+            fields=dict(self.fields),
             turn=self.turn,
             won=self.won,
         )
@@ -260,6 +265,8 @@ def pokemon_to_sim(mon, is_opponent: bool = False, profile: Optional[dict] = Non
     # Fainted
     fainted = getattr(mon, "fainted", False) or current_hp <= 0
 
+    level = getattr(mon, "level", 100) or 100
+
     return SimPokemon(
         species=species,
         current_hp=current_hp,
@@ -273,6 +280,7 @@ def pokemon_to_sim(mon, is_opponent: bool = False, profile: Optional[dict] = Non
         item=item,
         ability=getattr(mon, "ability", None),
         moves=dict(getattr(mon, "moves", None) or {}),
+        level=level,
     )
 
 
@@ -309,6 +317,7 @@ def battle_to_sim_state(battle, opponent_profiles: Optional[dict] = None) -> Sim
         side_conditions=dict(getattr(battle, "side_conditions", {}) or {}),
         opponent_side_conditions=dict(getattr(battle, "opponent_side_conditions", {}) or {}),
         weather=dict(getattr(battle, "weather", {}) or {}),
+        fields=dict(getattr(battle, "fields", {}) or {}),
         turn=getattr(battle, "turn", 1),
         won=getattr(battle, "won", None),
     )
@@ -376,12 +385,62 @@ def _apply_spikes(pokemon: SimPokemon, layers: int) -> int:
     return max(1, math.floor(pokemon.max_hp * frac))
 
 
+def _extract_field_conditions(state: Optional[SimState], is_attacker_bot: bool) -> FieldConditions:
+    """Extract active Weather, Terrain, Screens, and Field conditions from SimState."""
+    if state is None:
+        return FieldConditions()
+
+    weather_name = None
+    if getattr(state, "weather", None):
+        for w in state.weather.keys():
+            w_str = w.name.lower() if hasattr(w, "name") else str(w).lower()
+            weather_name = w_str
+            break
+
+    terrain_name = None
+    if getattr(state, "fields", None):
+        for f in state.fields.keys():
+            f_str = f.name.lower() if hasattr(f, "name") else str(f).lower()
+            if "electric" in f_str:
+                terrain_name = "electric"
+                break
+            elif "grassy" in f_str:
+                terrain_name = "grassy"
+                break
+            elif "psychic" in f_str:
+                terrain_name = "psychic"
+                break
+            elif "misty" in f_str:
+                terrain_name = "misty"
+                break
+
+    # Check screens
+    reflect = False
+    light_screen = False
+    if is_attacker_bot:
+        opp_sc = getattr(state, "opponent_side_conditions", {}) or {}
+        reflect = any("reflect" in (k.name.lower() if hasattr(k, "name") else str(k).lower()) for k in opp_sc.keys())
+        light_screen = any("lightscreen" in (k.name.lower() if hasattr(k, "name") else str(k).lower()) for k in opp_sc.keys())
+    else:
+        our_sc = getattr(state, "side_conditions", {}) or {}
+        reflect = any("reflect" in (k.name.lower() if hasattr(k, "name") else str(k).lower()) for k in our_sc.keys())
+        light_screen = any("lightscreen" in (k.name.lower() if hasattr(k, "name") else str(k).lower()) for k in our_sc.keys())
+
+    return FieldConditions(
+        weather=weather_name,
+        terrain=terrain_name,
+        reflect=reflect,
+        light_screen=light_screen,
+    )
+
+
 def _calculate_action_damage(
     attacker: SimPokemon,
     defender: SimPokemon,
     move_id: str,
     move_data: dict,
     is_attacker_bot: bool,
+    state: Optional[SimState] = None,
 ) -> tuple[int, int, str]:
     """
     Calculate (min_dmg, max_dmg, notes) for a move using inverse_damage_calc.
@@ -425,19 +484,124 @@ def _calculate_action_damage(
         if attacker.item == "Expert Belt" and type_eff <= 1.0:
             item_mod = 1.0
 
+    field_cond = _extract_field_conditions(state, is_attacker_bot)
+
     dmg_range = calculate_damage_range(
         attacker_stat=atk_stat,
         defender_stat=def_stat,
         base_power=base_power,
         type_effectiveness=type_eff,
         stab=stab,
+        field=field_cond,
         item_modifier=item_mod,
         move_category=category,
         stat_stage_atk=atk_stage,
         stat_stage_def=def_stage,
+        weather=field_cond.weather,
+        terrain=field_cond.terrain,
+        move_type=move_type,
+        move_id=move_id,
+        defender_types=def_types,
+        level=getattr(attacker, "level", 100) or 100,
     )
 
     return dmg_range.min_damage, dmg_range.max_damage, "damage"
+
+
+def _apply_move_side_effects(
+    attacker: Optional[SimPokemon],
+    defender: Optional[SimPokemon],
+    move_data: dict,
+    damage_dealt: int,
+    state: SimState,
+    is_attacker_bot: bool,
+) -> None:
+    """
+    Apply stat boosts, recovery, drain, recoil, status afflictions,
+    and field/hazard side conditions to the simulated state.
+    """
+    if not move_data:
+        return
+
+    # 1. Primary Stat Boosts (e.g. Swords Dance, Calm Mind, Dragon Dance, Screech)
+    boosts = move_data.get("boosts")
+    target = move_data.get("target", "normal")
+    if boosts and isinstance(boosts, dict):
+        if target in ("self", "adjacentAllyOrSelf"):
+            if attacker and not attacker.fainted:
+                for stat, val in boosts.items():
+                    attacker.boosts[stat] = max(-6, min(6, attacker.boosts.get(stat, 0) + val))
+        else:
+            if defender and not defender.fainted:
+                for stat, val in boosts.items():
+                    defender.boosts[stat] = max(-6, min(6, defender.boosts.get(stat, 0) + val))
+
+    # 2. Self Secondary Stat Boosts/Drops (e.g. Close Combat, Draco Meteor, Superpower)
+    self_effect = move_data.get("self")
+    if self_effect and isinstance(self_effect, dict):
+        self_boosts = self_effect.get("boosts")
+        if self_boosts and isinstance(self_boosts, dict) and attacker and not attacker.fainted:
+            for stat, val in self_boosts.items():
+                attacker.boosts[stat] = max(-6, min(6, attacker.boosts.get(stat, 0) + val))
+
+    # 3. Direct HP Recovery (e.g. Recover, Roost, Soft-Boiled, Slack Off, Synthesis)
+    heal = move_data.get("heal")
+    if heal and isinstance(heal, (list, tuple)) and len(heal) == 2 and attacker and not attacker.fainted:
+        num, denom = heal
+        if denom > 0:
+            heal_amount = math.floor(attacker.max_hp * (num / denom))
+            attacker.current_hp = min(attacker.max_hp, attacker.current_hp + heal_amount)
+            attacker.current_hp_fraction = attacker.current_hp / max(1, attacker.max_hp)
+
+    # 4. Drain HP Recovery (e.g. Giga Drain, Drain Punch, Draining Kiss, Horn Leech)
+    drain = move_data.get("drain")
+    if drain and damage_dealt > 0 and isinstance(drain, (list, tuple)) and len(drain) == 2 and attacker and not attacker.fainted:
+        num, denom = drain
+        if denom > 0:
+            drain_amount = math.floor(damage_dealt * (num / denom))
+            attacker.current_hp = min(attacker.max_hp, attacker.current_hp + drain_amount)
+            attacker.current_hp_fraction = attacker.current_hp / max(1, attacker.max_hp)
+
+    # 5. Recoil Damage (e.g. Brave Bird, Flare Blitz, Head Smash, Wave Crash)
+    recoil = move_data.get("recoil")
+    if recoil and damage_dealt > 0 and isinstance(recoil, (list, tuple)) and len(recoil) == 2 and attacker and not attacker.fainted:
+        num, denom = recoil
+        if denom > 0:
+            recoil_amount = math.floor(damage_dealt * (num / denom))
+            attacker.current_hp = max(0, attacker.current_hp - recoil_amount)
+            attacker.current_hp_fraction = attacker.current_hp / max(1, attacker.max_hp)
+            if attacker.current_hp == 0:
+                attacker.fainted = True
+
+    # 6. Status Afflictions (e.g. Will-O-Wisp, Thunder Wave, Toxic, Spore)
+    status = move_data.get("status")
+    if status and defender and not defender.status and not defender.fainted:
+        def_types = [_type_name(t).upper() for t in defender.types]
+        status_code = status.upper()
+        # Type immunities
+        immune = False
+        if status_code == "BRN" and "FIRE" in def_types:
+            immune = True
+        elif status_code == "PAR" and "ELECTRIC" in def_types:
+            immune = True
+        elif status_code in ("PSN", "TOX", "TOK") and ("POISON" in def_types or "STEEL" in def_types):
+            immune = True
+        elif status_code == "FRZ" and "ICE" in def_types:
+            immune = True
+
+        if not immune:
+            defender.status = status_code
+
+    # 7. Side Conditions (Stealth Rock, Spikes, Toxic Spikes, Sticky Web, Reflect, Light Screen)
+    side_cond = move_data.get("sideCondition")
+    if side_cond:
+        target = move_data.get("target", "foeSide")
+        if target in ("foeSide", "normal", "allAdjacentFoes"):
+            target_sc = state.opponent_side_conditions if is_attacker_bot else state.side_conditions
+        else:
+            target_sc = state.side_conditions if is_attacker_bot else state.opponent_side_conditions
+        cond_name = side_cond.upper()
+        target_sc[cond_name] = target_sc.get(cond_name, 0) + 1
 
 
 def _simulate_ordered_outcomes(
@@ -555,12 +719,14 @@ def simulate_turn_outcomes(
             min_d, max_d, _ = _calculate_action_damage(
                 s_hit.active_pokemon, s_hit.opponent_active_pokemon,
                 our_move_id, our_move_data, is_attacker_bot=True,
+                state=s_hit,
             )
             avg_d = (min_d + max_d) // 2
             s_hit.opponent_active_pokemon.current_hp = max(0, s_hit.opponent_active_pokemon.current_hp - avg_d)
             s_hit.opponent_active_pokemon.current_hp_fraction = s_hit.opponent_active_pokemon.current_hp / s_hit.opponent_active_pokemon.max_hp
             if s_hit.opponent_active_pokemon.current_hp == 0:
                 s_hit.opponent_active_pokemon.fainted = True
+            _apply_move_side_effects(s_hit.active_pokemon, s_hit.opponent_active_pokemon, our_move_data, avg_d, s_hit, is_attacker_bot=True)
 
             switch_outcomes = [(s_hit, p_hit)]
             if p_hit < 1.0:
@@ -598,13 +764,15 @@ def simulate_turn_outcomes(
             s_hit = s.clone()
             min_d, max_d, _ = _calculate_action_damage(
                 s_hit.opponent_active_pokemon, s_hit.active_pokemon,
-                opp_action.move_id, opp_action.move_data, is_attacker_bot=False
+                opp_action.move_id, opp_action.move_data, is_attacker_bot=False,
+                state=s_hit,
             )
             avg_d = (min_d + max_d) // 2
             s_hit.active_pokemon.current_hp = max(0, s_hit.active_pokemon.current_hp - avg_d)
             s_hit.active_pokemon.current_hp_fraction = s_hit.active_pokemon.current_hp / s_hit.active_pokemon.max_hp
             if s_hit.active_pokemon.current_hp == 0:
                 s_hit.active_pokemon.fainted = True
+            _apply_move_side_effects(s_hit.opponent_active_pokemon, s_hit.active_pokemon, opp_action.move_data, avg_d, s_hit, is_attacker_bot=False)
 
             outcomes.append((s_hit, p_hit))
             if p_hit < 1.0:
@@ -633,28 +801,33 @@ def simulate_turn_outcomes(
             s1 = s.clone()
             min_d1, max_d1, _ = _calculate_action_damage(
                 s1.active_pokemon, s1.opponent_active_pokemon,
-                our_move_id, our_move_data, is_attacker_bot=True
+                our_move_id, our_move_data, is_attacker_bot=True,
+                state=s1,
             )
             avg_d1 = (min_d1 + max_d1) // 2
             s1.opponent_active_pokemon.current_hp = max(0, s1.opponent_active_pokemon.current_hp - avg_d1)
             s1.opponent_active_pokemon.current_hp_fraction = s1.opponent_active_pokemon.current_hp / s1.opponent_active_pokemon.max_hp
-
-            # If opponent fainted, opponent DOES NOT counterattack
             if s1.opponent_active_pokemon.current_hp == 0:
                 s1.opponent_active_pokemon.fainted = True
+            _apply_move_side_effects(s1.active_pokemon, s1.opponent_active_pokemon, our_move_data, avg_d1, s1, is_attacker_bot=True)
+
+            # If opponent fainted, opponent DOES NOT counterattack
+            if s1.opponent_active_pokemon.fainted:
                 outcomes.append((s1, order_prob * p_our_hit))
             else:
                 # Opponent counterattacks
                 s1_hit2 = s1.clone()
                 min_d2, max_d2, _ = _calculate_action_damage(
                     s1_hit2.opponent_active_pokemon, s1_hit2.active_pokemon,
-                    opp_action.move_id, opp_action.move_data, is_attacker_bot=False
+                    opp_action.move_id, opp_action.move_data, is_attacker_bot=False,
+                    state=s1_hit2,
                 )
                 avg_d2 = (min_d2 + max_d2) // 2
                 s1_hit2.active_pokemon.current_hp = max(0, s1_hit2.active_pokemon.current_hp - avg_d2)
                 s1_hit2.active_pokemon.current_hp_fraction = s1_hit2.active_pokemon.current_hp / s1_hit2.active_pokemon.max_hp
                 if s1_hit2.active_pokemon.current_hp == 0:
                     s1_hit2.active_pokemon.fainted = True
+                _apply_move_side_effects(s1_hit2.opponent_active_pokemon, s1_hit2.active_pokemon, opp_action.move_data, avg_d2, s1_hit2, is_attacker_bot=False)
 
                 outcomes.append((s1_hit2, order_prob * p_our_hit * p_opp_hit))
                 if p_opp_hit < 1.0:
@@ -666,13 +839,15 @@ def simulate_turn_outcomes(
                 s2_hit2 = s2.clone()
                 min_d2, max_d2, _ = _calculate_action_damage(
                     s2_hit2.opponent_active_pokemon, s2_hit2.active_pokemon,
-                    opp_action.move_id, opp_action.move_data, is_attacker_bot=False
+                    opp_action.move_id, opp_action.move_data, is_attacker_bot=False,
+                    state=s2_hit2,
                 )
                 avg_d2 = (min_d2 + max_d2) // 2
                 s2_hit2.active_pokemon.current_hp = max(0, s2_hit2.active_pokemon.current_hp - avg_d2)
                 s2_hit2.active_pokemon.current_hp_fraction = s2_hit2.active_pokemon.current_hp / s2_hit2.active_pokemon.max_hp
                 if s2_hit2.active_pokemon.current_hp == 0:
                     s2_hit2.active_pokemon.fainted = True
+                _apply_move_side_effects(s2_hit2.opponent_active_pokemon, s2_hit2.active_pokemon, opp_action.move_data, avg_d2, s2_hit2, is_attacker_bot=False)
 
                 outcomes.append((s2_hit2, order_prob * (1.0 - p_our_hit) * p_opp_hit))
                 if p_opp_hit < 1.0:
@@ -684,28 +859,33 @@ def simulate_turn_outcomes(
             s1 = s.clone()
             min_d2, max_d2, _ = _calculate_action_damage(
                 s1.opponent_active_pokemon, s1.active_pokemon,
-                opp_action.move_id, opp_action.move_data, is_attacker_bot=False
+                opp_action.move_id, opp_action.move_data, is_attacker_bot=False,
+                state=s1,
             )
             avg_d2 = (min_d2 + max_d2) // 2
             s1.active_pokemon.current_hp = max(0, s1.active_pokemon.current_hp - avg_d2)
             s1.active_pokemon.current_hp_fraction = s1.active_pokemon.current_hp / s1.active_pokemon.max_hp
-
-            # If Bot fainted, Bot does NOT counterattack
             if s1.active_pokemon.current_hp == 0:
                 s1.active_pokemon.fainted = True
+            _apply_move_side_effects(s1.opponent_active_pokemon, s1.active_pokemon, opp_action.move_data, avg_d2, s1, is_attacker_bot=False)
+
+            # If Bot fainted, Bot does NOT counterattack
+            if s1.active_pokemon.fainted:
                 outcomes.append((s1, order_prob * p_opp_hit))
             else:
                 # Bot counterattacks
                 s1_hit1 = s1.clone()
                 min_d1, max_d1, _ = _calculate_action_damage(
                     s1_hit1.active_pokemon, s1_hit1.opponent_active_pokemon,
-                    our_move_id, our_move_data, is_attacker_bot=True
+                    our_move_id, our_move_data, is_attacker_bot=True,
+                    state=s1_hit1,
                 )
                 avg_d1 = (min_d1 + max_d1) // 2
                 s1_hit1.opponent_active_pokemon.current_hp = max(0, s1_hit1.opponent_active_pokemon.current_hp - avg_d1)
                 s1_hit1.opponent_active_pokemon.current_hp_fraction = s1_hit1.opponent_active_pokemon.current_hp / s1_hit1.opponent_active_pokemon.max_hp
                 if s1_hit1.opponent_active_pokemon.current_hp == 0:
                     s1_hit1.opponent_active_pokemon.fainted = True
+                _apply_move_side_effects(s1_hit1.active_pokemon, s1_hit1.opponent_active_pokemon, our_move_data, avg_d1, s1_hit1, is_attacker_bot=True)
 
                 outcomes.append((s1_hit1, order_prob * p_opp_hit * p_our_hit))
                 if p_our_hit < 1.0:
@@ -717,13 +897,15 @@ def simulate_turn_outcomes(
                 s2_hit1 = s2.clone()
                 min_d1, max_d1, _ = _calculate_action_damage(
                     s2_hit1.active_pokemon, s2_hit1.opponent_active_pokemon,
-                    our_move_id, our_move_data, is_attacker_bot=True
+                    our_move_id, our_move_data, is_attacker_bot=True,
+                    state=s2_hit1,
                 )
                 avg_d1 = (min_d1 + max_d1) // 2
                 s2_hit1.opponent_active_pokemon.current_hp = max(0, s2_hit1.opponent_active_pokemon.current_hp - avg_d1)
                 s2_hit1.opponent_active_pokemon.current_hp_fraction = s2_hit1.opponent_active_pokemon.current_hp / s2_hit1.opponent_active_pokemon.max_hp
                 if s2_hit1.opponent_active_pokemon.current_hp == 0:
                     s2_hit1.opponent_active_pokemon.fainted = True
+                _apply_move_side_effects(s2_hit1.active_pokemon, s2_hit1.opponent_active_pokemon, our_move_data, avg_d1, s2_hit1, is_attacker_bot=True)
 
                 outcomes.append((s2_hit1, order_prob * (1.0 - p_opp_hit) * p_our_hit))
                 if p_our_hit < 1.0:
@@ -1032,6 +1214,10 @@ class ExpectiminimaxEngine:
                 opp_ev += leaf_score * chance_prob
 
             total_ev += opp_ev * opp_act.probability
+
+        # Apply switch tempo cost to prevent speculative ping-pong switches
+        if our_action.action_type == "switch":
+            total_ev -= 50.0
 
         return total_ev
 

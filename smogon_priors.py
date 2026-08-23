@@ -217,6 +217,7 @@ class SmogonPriors:
         self._stats_data: Optional[dict] = None
         self._sets_data: Optional[dict] = None
         self._name_lookup: Optional[dict[str, str]] = None
+        self._logged_missing: set[str] = set()
 
     # ── Generation detection ────────────────────────────────────────────────
     @staticmethod
@@ -352,12 +353,13 @@ class SmogonPriors:
                     break
 
         if mon is None:
-            logger.warning(
-                "Species '%s' (normalised: '%s') not found in %s stats",
-                species_name,
-                display_name,
-                self.format_id,
-            )
+            if display_name not in self._logged_missing:
+                self._logged_missing.add(display_name)
+                logger.info(
+                    "Species '%s' not found in %s stats -- using base-stat prior fallback",
+                    display_name,
+                    self.format_id,
+                )
             return None
 
         # ── Parse moves ─────────────────────────────────────────────────

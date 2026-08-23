@@ -80,6 +80,7 @@ STATUS_PENALTIES: dict[str, float] = {
     "FRZ": -150.0,     # Freeze: even worse, but rare
     "BRN": -80.0,      # Burn: halves phys Atk + residual damage
     "TOK": -100.0,     # Toxic: escalating damage, very threatening
+    "TOX": -100.0,     # Toxic (alternative code)
     "PSN": -50.0,      # Regular poison: steady chip
     "PAR": -70.0,      # Paralysis: 25% full para + halves speed
 }
@@ -277,6 +278,14 @@ def evaluate_state(battle) -> float:
     our_hp_total, our_alive, our_total = _team_hp_summary(our_team)
     opp_hp_total, opp_alive, opp_total = _team_hp_summary(opp_team)
 
+    # In 6v6 matches, unrevealed opponent bench Pokémon are still alive at 100% HP.
+    # (On Turn 1 only 1 opp mon is in opponent_team; the rest are alive and unrevealed)
+    if our_total > 1 and opp_total < our_total:
+        unrevealed = our_total - opp_total
+        opp_alive += unrevealed
+        opp_hp_total += unrevealed * 1.0
+        opp_total = our_total
+
     # Check terminal faints if teams are populated
     if our_total > 0 and our_alive == 0:
         return SCORE_LOSS
@@ -446,7 +455,15 @@ def _score_hazards(side_conditions: dict, multiplier: float = 1.0) -> float:
     """
     score = 0.0
     for condition, value in side_conditions.items():
-        cond_name = condition.name if hasattr(condition, "name") else str(condition)
+        raw = condition.name if hasattr(condition, "name") else str(condition)
+        cond_name = raw.upper().replace("-", "_").replace(" ", "_")
+        if cond_name == "STEALTHROCK":
+            cond_name = "STEALTH_ROCK"
+        elif cond_name == "TOXICSPIKES":
+            cond_name = "TOXIC_SPIKES"
+        elif cond_name == "STICKYWEB":
+            cond_name = "STICKY_WEB"
+
         if cond_name in HAZARD_VALUES:
             base_val = HAZARD_VALUES[cond_name]
             # Spikes and Toxic Spikes stack (value = layer count)
@@ -461,7 +478,13 @@ def _score_screens(side_conditions: dict, multiplier: float = 1.0) -> float:
     """Score screens (Reflect, Light Screen, Aurora Veil) on a side."""
     score = 0.0
     for condition in side_conditions:
-        cond_name = condition.name if hasattr(condition, "name") else str(condition)
+        raw = condition.name if hasattr(condition, "name") else str(condition)
+        cond_name = raw.upper().replace("-", "_").replace(" ", "_")
+        if cond_name == "LIGHTSCREEN":
+            cond_name = "LIGHT_SCREEN"
+        elif cond_name == "AURORAVEIL":
+            cond_name = "AURORA_VEIL"
+
         if cond_name in SCREEN_VALUES:
             score += SCREEN_VALUES[cond_name]
     return score * multiplier
@@ -470,7 +493,8 @@ def _score_screens(side_conditions: dict, multiplier: float = 1.0) -> float:
 def _score_tailwind(side_conditions: dict, multiplier: float = 1.0) -> float:
     """Score Tailwind on a side."""
     for condition in side_conditions:
-        cond_name = condition.name if hasattr(condition, "name") else str(condition)
+        raw = condition.name if hasattr(condition, "name") else str(condition)
+        cond_name = raw.upper().replace("-", "_").replace(" ", "_")
         if cond_name == "TAILWIND":
             return WEIGHT_TAILWIND * multiplier
     return 0.0
