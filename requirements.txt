@@ -1,3 +1,10 @@
+# Core Runtime Dependencies (Live Battles & Inference)
 poke-env>=0.8.0
 numpy>=1.24.0
 requests>=2.31.0
+onnxruntime>=1.15.0
+
+# Optional Dependencies (For training neural policy net in Google Colab / GPU)
+# torch>=2.0.0
+# onnx>=1.14.0
+
