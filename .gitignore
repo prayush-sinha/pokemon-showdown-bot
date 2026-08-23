@@ -16,6 +16,8 @@ data/
 *.patch
 
 # Internal documentation and blueprints (keep local)
+FutureSightBot_Technical_Whitepaper.md
+three_month_project_report.md
 UPGRADE_ROADMAP.md
 Future_Sight_AI_Clone_Blueprint.pdf
 
