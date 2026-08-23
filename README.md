@@ -1,12 +1,12 @@
-# FutureSight AI — Pokémon Showdown Competitive Battle AI
+# FutureSight AI: Game-Theoretic Pokemon Showdown Battle Engine
 
-An advanced, game-theoretic Pokémon Showdown AI battle engine powered by **Simultaneous Expectiminimax Search**, **Set-Transformer Neural Policy Networks (ONNX)**, **Inverse Damage Calculation**, and **Smogon Metagame Priors**.
+FutureSight AI is an autonomous, high-performance competitive Pokemon Showdown battle engine. It combines simultaneous-move game theory, Set-Transformer neural policy networks, reverse-engineered state estimation (inverse damage calculation), and empirical metagame priors to solve imperfect-information decisions in real time.
 
 ---
 
-## 🌟 Architecture & Key Features
+## 1. System Architecture
 
-FutureSight AI uses a multi-layered decision pipeline to tackle simultaneous turns, imperfect information, metagame priors, and battle RNG:
+The decision engine operates through a multi-stage pipeline designed to handle simultaneous actions, hidden information, and probabilistic execution:
 
 ```
 +-----------------------------------------------------------------------------------+
@@ -14,64 +14,86 @@ FutureSight AI uses a multi-layered decision pipeline to tackle simultaneous tur
 +-----------------------------------------------------------------------------------+
      |                                                                         ^
      v                                                                         |
-[Phase 1: poke-env Protocol Bridge]                                   [Optimal Action]
-  - Async WebSocket protocol loop & action dispatch                            |
-  - Real-time battle state tracking & Gimmick execution (Mega / Tera)          |
+[Protocol Bridge & State Extraction]                                  [Selected Action]
+  - Asynchronous WebSocket protocol handler (`poke-env`)                       |
+  - Real-time battle state tracking and gimmick management (Mega / Tera)       |
      |                                                                         |
      v                                                                         |
-[Phase 2: Smogon Priors & Metagame Scouting]                                   |
-  - Live usage statistics from Smogon datasets across all formats              |
-  - Probability priors for unrevealed moves, items, abilities, and spreads     |
+[Metagame Prior Engine]                                                        |
+  - Empirical usage distributions sourced from Smogon competitive datasets     |
+  - Bayesian priors for unrevealed moves, items, abilities, and EV spreads     |
      |                                                                         |
      v                                                                         |
-[Phase 3: Inverse Damage Calculator]                                           |
-  - Exact Gen 9 forward damage formula (16 discrete rolls, weather, terrain)   |
-  - Reverse-engineers opponent EV investment, items, and stat tiers            |
+[Inverse Damage Calculator]                                                    |
+  - Exact Generation 9 discrete forward damage model (16 rolls, weather, field)|
+  - Reverse-engineers opponent EV investment, items, and defensive tiers       |
      |                                                                         |
      v                                                                         |
-[Phase 6: Set-Transformer Policy Network (ONNX)]                               |
-  - Multi-head self-attention over active & bench Pokémon slots                |
-  - Predicts likely opponent moves & switches, pruning low-probability branches|
+[Set-Transformer Policy Network (ONNX)]                                        |
+  - Multi-head self-attention over active and bench Pokemon slots              |
+  - Predicts opponent action probabilities and prunes low-likelihood branches  |
      |                                                                         |
      v                                                                         |
-[Phase 4 & 5: Simultaneous Expectiminimax Tree Search] ------------------------+
-  - Nash Expected Value calculation across simultaneous action matrices
-  - Full forward simulation of status moves, stat boosts/drops, recovery, drain, recoil, and hazards
-  - Speed-tie chance nodes & anti-ping-pong switch tempo penalties
-  - Level scaling (Level 50 for BSS/Champions vs Level 100 for OU)
+[Simultaneous Expectiminimax Tree Search] -------------------------------------+
+  - Nash Expected Value optimization over simultaneous action matrices
+  - Full forward simulation of stat modifications, recovery, drain, and hazards
+  - Speed-tie chance nodes and tempo penalty regularization
+  - Adaptive level scaling (Level 50 for BSS/VGC; Level 100 for standard tiers)
 ```
 
 ---
 
-## 🎮 Multi-Format Support
+## 2. Core Engine Components
 
-The engine dynamically loads models, vocabulary, and Smogon priors according to the chosen battle format:
+### 2.1 Simultaneous Expectiminimax Search
+Unlike sequential games (e.g., Chess), Pokemon battles feature simultaneous turn execution. The search engine constructs a payoff matrix for each turn pair $(a_{\text{bot}}, a_{\text{opp}})$ and evaluates leaves using an Expected Value heuristic over opponent action probabilities:
 
-* **Gen 9 Random Battles**: `gen9randombattle`
-* **Standard Gen 9 OU**: `gen9ou`
-* **Champions Singles BSS (Mega Evolutions & Cartridge Rules)**: `gen9championsbssregma` / `gen9championsbssregmb`
-* **National Dex**: `gen9nationaldex`
+$$\text{EV}(a_{\text{bot}}) = \sum_{a_{\text{opp}}} P(a_{\text{opp}} \mid s) \cdot \mathbb{E}[\mathcal{H}(s')]$$
+
+* **Forward Simulation**: Accurately simulates stat stage modifiers ($\pm 6$), primary/secondary stat drops (e.g., Close Combat, Draco Meteor), direct healing (e.g., Recover, Roost), damage-proportional draining (e.g., Drain Punch, Draining Kiss), recoil recoil damage, status afflictions with type immunities, and persistent hazards.
+* **Speed-Tie Chance Nodes**: Models 50/50 priority and speed ties explicitly via probabilistic branching.
+* **Switch Tempo Regularization**: Penalizes non-productive switching cycles when aggressive active lines exist.
+
+### 2.2 Neural Policy Network (ONNX Runtime)
+* **Architecture**: Set-Transformer with multi-head self-attention invariant to bench ordering. Encodes 12 Pokemon slots (6 friendly, 6 opponent) with categorical embeddings (species, items, abilities, status, tera types) and continuous state attributes.
+* **Action Pruning**: Opponent action branches with predicted probability below the threshold ($P < 0.05$) are pruned, with the remaining distribution normalized.
+* **Inference**: Exported to ONNX and executed via ONNX Runtime CPU execution provider with sub-millisecond latency.
+
+### 2.3 Inverse Damage Calculation
+* Intersects observed damage intervals against the 16 discrete damage rolls ($\lfloor 85\% \dots 100\% \rfloor$) to infer opponent offensive stats and identify hidden items (e.g., Choice Band, Choice Specs, Life Orb).
+* Supports complete Generation 9 modifiers: Harsh Sunlight, Heavy Rain, Snow Defense boost (Ice), Sandstorm Sp. Def boost (Rock), Electric/Grassy/Psychic/Misty terrains, and Reflect/Light Screen.
 
 ---
 
-## 📁 Repository Structure
+## 3. Supported Formats
+
+The bot supports dynamic data and model loading across multiple competitive tiers:
+
+* **Gen 9 Random Battles**: `gen9randombattle`
+* **Gen 9 OverUsed (OU)**: `gen9ou`
+* **Gen 9 Champions Singles BSS (with Mega Evolutions)**: `gen9championsbssregma`, `gen9championsbssregmb`
+* **Gen 9 National Dex**: `gen9nationaldex`
+
+---
+
+## 4. Repository Structure
 
 ```text
 pokemon-showdown-bot/
-├── bot.py                     # Main bot client, battle loop, and CLI runner
-├── expectiminimax.py          # Simultaneous Expectiminimax search engine & forward simulator
-├── evaluator.py               # State scoring heuristic (+10,000 to -10,000) & payoff matrix generator
-├── inverse_damage_calc.py     # Forward & inverse damage calculator (Gen 9 formula)
-├── smogon_priors.py           # Smogon statistics fetcher and caching engine
-├── policy_net.py              # Set-Transformer policy network architecture (PyTorch)
-├── policy_inference.py        # Ultra-fast CPU inference wrapper (ONNX Runtime)
-├── scrape_replays.py          # Parallel, rate-limited Showdown replay scraper
+├── bot.py                     # Main client, game loop, and CLI runner
+├── expectiminimax.py          # Simultaneous Expectiminimax search engine
+├── evaluator.py               # Heuristic evaluation functions & payoff matrix constructor
+├── inverse_damage_calc.py     # Forward & inverse damage calculation models
+├── smogon_priors.py           # Empirical Smogon usage statistics provider
+├── policy_net.py              # Set-Transformer PyTorch neural network definition
+├── policy_inference.py        # ONNX Runtime inference wrapper
+├── scrape_replays.py          # Showdown replay scraping and ingestion pipeline
 ├── dataset_parser.py          # Replay log parser & tensor dataset generator
 ├── train_policy.py            # Neural network training loop with ONNX exporter
-├── test_suite.py              # Automated regression and edge-case unit tests
-├── config.py                  # Central configuration & format path resolver
-├── requirements.txt           # Package dependencies
-└── data/                      # Format-isolated model weights and vocabs (local/Colab)
+├── test_suite.py              # Automated regression and edge-case unit test suite
+├── config.py                  # System configuration and path management
+├── requirements.txt           # Python package dependencies
+└── data/                      # Local format-specific artifacts (gitignored)
     ├── gen9ou/
     ├── gen9championsbssregma/
     └── gen9randombattle/
@@ -79,9 +101,11 @@ pokemon-showdown-bot/
 
 ---
 
-## 🚀 Quick Start
+## 5. Getting Started
 
-### 1. Installation
+### 5.1 Prerequisites and Installation
+
+Clone the repository and install the runtime dependencies:
 
 ```bash
 git clone https://github.com/prayush-sinha/pokemon-showdown-bot.git
@@ -89,56 +113,56 @@ cd pokemon-showdown-bot
 pip install -r requirements.txt
 ```
 
-### 2. Standalone Verification (No Server Needed)
+### 5.2 Verification
 
-Run the built-in offline test suites to verify all systems:
+Execute the offline unit tests and simulation dry-run:
 
 ```bash
-# Run the complete decision dry-run
+# Verify the complete decision pipeline offline
 python bot.py --dry-run
 
-# Run full unit & edge-case regression suite
+# Run full unit and regression test suite
 python test_suite.py
 ```
 
-### 3. Playing Live on Pokémon Showdown Ladder
+### 5.3 Live Battle Execution
 
-Select your format and number of games directly from the terminal:
+Run the bot against the live Pokémon Showdown ladder:
 
 ```bash
-# Play 5 games on the Gen 9 Random Battle ladder:
+# Play on the standard Gen 9 Random Battle ladder
 python bot.py --ladder 5 --format gen9randombattle
 
-# Play on the Standard Gen 9 OU ladder:
+# Play on the Gen 9 OU ladder
 python bot.py --ladder 1 --format gen9ou
 
-# Play Champions Singles BSS (with Mega Evolutions):
+# Play Champions Singles BSS (with Mega Evolution support)
 python bot.py --ladder 1 --format gen9championsbssregma
 
-# Challenge a specific player:
+# Challenge a specific user directly
 python bot.py --challenge "OpponentUsername" --format gen9ou
 
-# Accept incoming challenges in the lobby:
+# Accept incoming challenges from the lobby
 python bot.py --accept 1
 ```
 
 ---
 
-## 🧠 Training Custom Policy Models (Google Colab)
+## 6. Training Pipeline (Google Colab / GPU)
 
-You can scrape high-ELO replays and train custom neural policy networks on Google Colab with GPU acceleration:
+To train custom policy models on high-ELO replay datasets:
 
 ### Step 1: Scrape Replays
 ```bash
 python scrape_replays.py --format gen9ou --count 5000 --min-rating 1500
 ```
 
-### Step 2: Parse Dataset & Extract Vocabulary
+### Step 2: Parse Dataset and Generate Vocabularies
 ```bash
 python dataset_parser.py --format gen9ou
 ```
 
-### Step 3: Train Transformer & Export ONNX
+### Step 3: Train Policy Network and Export to ONNX
 ```bash
 python train_policy.py \
     --dataset data/dataset_gen9ou.pt \
@@ -150,27 +174,27 @@ python train_policy.py \
     --batch-size 64
 ```
 
-Copy the generated `policy_net.onnx`, `policy_net.pth`, `vocab_<format>.json`, and `feature_schema_<format>.json` into your local `data/<format>/` folder!
+Place the generated `policy_net.onnx`, `policy_net.pth`, `vocab_<format>.json`, and `feature_schema_<format>.json` into the corresponding `data/<format>/` directory.
 
 ---
 
-## 🛠️ Configuration Options
+## 7. Configuration Reference
 
-Configuration defaults live in `config.py` and can be overridden via CLI arguments or environment variables:
+System options can be configured via environment variables or modified directly in `config.py`:
 
-| Variable | Default | Description |
+| Parameter | Default | Description |
 | :--- | :--- | :--- |
-| `SERVER_MODE` | `showdown` | `"showdown"` (play.pokemonshowdown.com) or `"local"` (localhost) |
-| `BOT_USERNAME` | — | Pokémon Showdown account username |
-| `BOT_PASSWORD` | — | Pokémon Showdown account password |
-| `BATTLE_FORMAT` | `gen9randombattle` | Default battle format to play |
-| `PRIORS_FORMAT` | `gen9ou` | Smogon stats endpoint for priors |
-| `POLICY_NET_ENABLED` | `true` | Enables ONNX policy net pruning |
-| `POLICY_PRUNE_THRESHOLD` | `0.05` | Pruning cutoff probability for opponent actions |
-| `LOG_LEVEL` | `25` | Logging verbosity (`20`=Debug/WS, `25`=Battle events, `30`=Quiet) |
+| `SERVER_MODE` | `showdown` | Server target: `"showdown"` (play.pokemonshowdown.com) or `"local"` (localhost) |
+| `BOT_USERNAME` | — | Account username on Pokémon Showdown |
+| `BOT_PASSWORD` | — | Account password on Pokémon Showdown |
+| `BATTLE_FORMAT` | `gen9randombattle` | Default battle format |
+| `PRIORS_FORMAT` | `gen9ou` | Smogon stats endpoint for empirical priors |
+| `POLICY_NET_ENABLED` | `true` | Enables policy-network opponent action pruning |
+| `POLICY_PRUNE_THRESHOLD` | `0.05` | Probability cutoff threshold for action pruning |
+| `LOG_LEVEL` | `25` | Logging verbosity level |
 
 ---
 
-## 📜 License
+## 8. License
 
-MIT License. Open-source and free for competitive analysis, research, and enhancement.
+This project is licensed under the MIT License.
